@@ -9,6 +9,7 @@ DIDC_TARGET = _build/default/exes/didc.exe
 DESER_TARGET = _build/default/exes/deser.exe
 CANDID_TESTS_TARGET = _build/default/exes/candid_tests.exe
 MOC_JS_TARGET = _build/default/js/moc_js.bc.js
+MOC_WASM_TARGET = _build/default/js/moc_wasm.bc.wasm.js
 MOC_INTERPRETER_TARGET = _build/default/js/moc_interpreter.bc.js
 DIDC_JS_TARGET = _build/default/js/didc_js.bc.js
 
@@ -52,6 +53,11 @@ moc.js: $(SOURCE_ID)
 	dune build $(DUNE_OPTS) $(MOC_JS_TARGET)
 	@ln -fs $(MOC_JS_TARGET) $@
 	ls -al $(MOC_JS_TARGET)
+
+moc.wasm: $(SOURCE_ID)
+	dune build $(DUNE_OPTS) $(MOC_WASM_TARGET)
+	@ln -fs $(MOC_WASM_TARGET) $@
+	ls -al $(MOC_WASM_TARGET)
 
 moc_interpreter.js: $(SOURCE_ID)
 	dune build $(DUNE_OPTS) $(MOC_INTERPRETER_TARGET)

@@ -1,5 +1,13 @@
 (library
   (name codegen)
+  (modules (:standard \ instrList_test))
   (libraries wasm lib mo_config source_id lang_utils wasm_exts ir_def linking)
   (instrumentation (backend bisect_ppx --bisect-silent yes))
+)
+
+(test
+  (name instrList_test)
+  (modules instrList_test)
+  (modes byte)
+  (libraries codegen wasm wasm_exts lib)
 )

@@ -346,63 +346,209 @@ let calculate_renaming n_imports1 n_things1 n_imports2 resolved12 resolved21 : (
 
 (* AST traversals *)
 
-let rename_globals rn : module_' -> module_' = fun m ->
-  let var' = rn in
-  let var = phrase var' in
+type index_remapping = {
+  type_index : renumbering;
+  function_index : renumbering;
+  global_index : renumbering;
+}
 
-  let rec instr' = function
-    | Block (ty, is) -> Block (ty, instrs is)
-    | Loop (ty, is) -> Loop (ty, instrs is)
-    | If (ty, is1, is2) -> If (ty, instrs is1, instrs is2)
-    | GlobalGet v -> GlobalGet (var v)
-    | GlobalSet v -> GlobalSet (var v)
-    | i -> i
-  and instr i = phrase instr' i
-  and instrs is = List.map instr is in
+let identity_index i = i
 
-  let func' f = { f with body = instrs f.body } in
-  let func = phrase func' in
-  let funcs = List.map func in
+let identity_index_remapping = {
+  type_index = identity_index;
+  function_index = identity_index;
+  global_index = identity_index;
+}
 
-  let const = phrase instrs in
-
-  let global' g = { g with value = const g.value } in
-  let global = phrase global' in
-  let globals = List.map global in
-
-  let table_segment' (s : var list segment') = { s with offset = const s.offset; } in
-  let table_segment = phrase (table_segment') in
-  let table_segments = List.map table_segment in
-
-  let segment_mode' (dmode : segment_mode') = 
-    match dmode with 
-      | Passive -> Passive
-      | Active { index; offset } -> Active { index; offset = const offset }
-      | Declarative -> Declarative
-    in
-  let segment_mode = phrase (segment_mode') in
-  let data_segment' (s : data_segment') = { s with dmode = segment_mode s.dmode; } in
-  let data_segment = phrase (data_segment') in
-  let data_segments = List.map data_segment in
-
-  (* The exports are used to resolve `GOT.mem`. 
-     Therefore, also update the exported global indices. *)
-  let export_desc' = function
-  | GlobalExport v -> GlobalExport (var v)
-  | other -> other
+let map_tail f xs =
+  let rec go acc = function
+    | [] -> List.rev acc
+    | x :: xs -> go (f x :: acc) xs
   in
-  let export_desc = phrase (export_desc') in
-  let export' (e: export') = { e with edesc = export_desc e.edesc } in
-  let export = phrase export' in
-  let exports = List.map export in
+  go [] xs
 
+(* The continuation is kept on the heap so remapping does not consume one
+   OCaml/Wasm call frame for every nested block. The current list and its
+   reversed output also make long flat bodies stack-bounded. *)
+type instruction_continuation =
+  | Instructions_done
+  | Finish_block of
+      instr * block_type * instr list * instr list * instruction_continuation
+  | Finish_loop of
+      instr * block_type * instr list * instr list * instruction_continuation
+  | Finish_if_then of
+      instr * block_type * instr list * instr list * instr list *
+      instruction_continuation
+  | Finish_if_else of
+      instr * block_type * instr list * instr list * instr list *
+      instruction_continuation
+
+let remap_var rn v = phrase rn v
+
+let remap_block_type remapping = function
+  | VarBlockType type_index ->
+    VarBlockType (remap_var remapping.type_index type_index)
+  | ValBlockType _ as block_type -> block_type
+
+let remap_instructions remapping instructions =
+  let remap_shallow instruction =
+    let it = match instruction.it with
+      | Call function_index ->
+        Call (remap_var remapping.function_index function_index)
+      | CallIndirect (table_index, type_index) ->
+        CallIndirect (table_index, remap_var remapping.type_index type_index)
+      | GlobalGet global_index ->
+        GlobalGet (remap_var remapping.global_index global_index)
+      | GlobalSet global_index ->
+        GlobalSet (remap_var remapping.global_index global_index)
+      | Block _ | Loop _ | If _ -> assert false
+      | other -> other
+    in
+    { instruction with it }
+  in
+  let rec go remaining reversed continuation =
+    match remaining with
+    | instruction :: remaining ->
+      begin match instruction.it with
+      | Block (block_type, body) ->
+        go body []
+          (Finish_block
+            (instruction, block_type, remaining, reversed, continuation))
+      | Loop (block_type, body) ->
+        go body []
+          (Finish_loop
+            (instruction, block_type, remaining, reversed, continuation))
+      | If (block_type, then_body, else_body) ->
+        (* The former recursive constructor expression observed the else body,
+           then body, and block type in that order. The type remapper assigns
+           first-seen indices, so retain that order explicitly. *)
+        go else_body []
+          (Finish_if_else
+            (instruction, block_type, then_body,
+             remaining, reversed, continuation))
+      | _ ->
+        go remaining (remap_shallow instruction :: reversed) continuation
+      end
+    | [] ->
+      let remapped = List.rev reversed in
+      begin match continuation with
+      | Instructions_done -> remapped
+      | Finish_block
+          (instruction, block_type, parent_remaining, parent_reversed,
+           parent_continuation) ->
+        let block_type = remap_block_type remapping block_type in
+        let instruction = { instruction with it = Block (block_type, remapped) } in
+        go parent_remaining (instruction :: parent_reversed) parent_continuation
+      | Finish_loop
+          (instruction, block_type, parent_remaining, parent_reversed,
+           parent_continuation) ->
+        let block_type = remap_block_type remapping block_type in
+        let instruction = { instruction with it = Loop (block_type, remapped) } in
+        go parent_remaining (instruction :: parent_reversed) parent_continuation
+      | Finish_if_else
+          (instruction, block_type, then_body, parent_remaining,
+           parent_reversed, parent_continuation) ->
+        go then_body []
+          (Finish_if_then
+            (instruction, block_type, remapped, parent_remaining,
+             parent_reversed, parent_continuation))
+      | Finish_if_then
+          (instruction, block_type, else_body, parent_remaining,
+           parent_reversed, parent_continuation) ->
+        let block_type = remap_block_type remapping block_type in
+        let instruction =
+          { instruction with it = If (block_type, remapped, else_body) }
+        in
+        go parent_remaining (instruction :: parent_reversed) parent_continuation
+      end
+  in
+  go instructions [] Instructions_done
+
+(* This remaps exactly the index occurrences handled by the former type,
+   function, and global passes. In particular, only globals are rewritten in
+   constant expressions; table, memory, local, label, and data indices remain
+   untouched. *)
+let remap_module_indices remapping (m : module_') : module_' =
+  let global_only =
+    { identity_index_remapping with global_index = remapping.global_index }
+  in
+  let remap_const const =
+    { const with it = remap_instructions global_only const.it }
+  in
+  (* The former record update evaluated imports before functions. This matters
+     because the type renamer assigns indices in first-seen order. *)
+  let imports =
+    map_tail (fun import ->
+      let idesc = match import.it.idesc.it with
+        | FuncImport type_index ->
+          { import.it.idesc with
+            it = FuncImport (remap_var remapping.type_index type_index) }
+        | _ -> import.it.idesc
+      in
+      { import with it = { import.it with idesc } }
+    ) m.imports
+  in
+  let funcs =
+    map_tail (fun func ->
+      (* The former function record update evaluated the body before ftype. *)
+      let body = remap_instructions remapping func.it.body in
+      let ftype = remap_var remapping.type_index func.it.ftype in
+      { func with it = { func.it with ftype; body } }
+    ) m.funcs
+  in
+  let globals =
+    map_tail (fun global ->
+      { global with
+        it = { global.it with value = remap_const global.it.value } }
+    ) m.globals
+  in
+  let elems =
+    map_tail (fun (elem : table_segment) ->
+      { elem with it = {
+          elem.it with
+          offset = remap_const elem.it.offset;
+          init = map_tail (remap_var remapping.function_index) elem.it.init;
+        } }
+    ) m.elems
+  in
+  let datas =
+    map_tail (fun data ->
+      let dmode = match data.it.dmode.it with
+        | Active { index; offset } ->
+          { data.it.dmode with it = Active { index; offset = remap_const offset } }
+        | Passive | Declarative -> data.it.dmode
+      in
+      { data with it = { data.it with dmode } }
+    ) m.datas
+  in
+  let exports =
+    map_tail (fun export ->
+      let edesc = match export.it.edesc.it with
+        | FuncExport function_index ->
+          { export.it.edesc with
+            it = FuncExport
+              (remap_var remapping.function_index function_index) }
+        | GlobalExport global_index ->
+          { export.it.edesc with
+            it = GlobalExport (remap_var remapping.global_index global_index) }
+        | _ -> export.it.edesc
+      in
+      { export with it = { export.it with edesc } }
+    ) m.exports
+  in
   { m with
-    funcs = funcs m.funcs;
-    globals = globals m.globals;
-    elems = table_segments m.elems;
-    datas = data_segments m.datas;
-    exports = exports m.exports;
+    funcs;
+    imports;
+    globals;
+    elems;
+    datas;
+    exports;
+    start = Option.map (remap_var remapping.function_index) m.start;
   }
+
+let rename_globals rn =
+  remap_module_indices
+    { identity_index_remapping with global_index = rn }
 
 let set_global global value = fun m ->
   let rec go i = function
@@ -470,52 +616,16 @@ let fill_global (global : int32) (value : Wasm_exts.Values.value) (uses_memory64
 
 let rename_funcs_name_section rn (ns : name_section) =
   { ns with
-    function_names = List.map (fun (fi, name) -> (rn fi, name)) ns.function_names;
-    locals_names = List.map (fun (fi, locals) -> (rn fi, locals)) ns.locals_names;
+    function_names =
+      map_tail (fun (fi, name) -> (rn fi, name)) ns.function_names;
+    locals_names =
+      map_tail (fun (fi, locals) -> (rn fi, locals)) ns.locals_names;
   }
 
-let rename_funcs_extended rn (em : extended_module) =
+let remap_extended_indices remapping (em : extended_module) =
   { em with
-    module_ = rename_funcs rn em.module_;
-    name = rename_funcs_name_section rn em.name;
-  }
-
-let rename_globals_extended rn (em : extended_module) =
-  { em with
-    module_ = rename_globals rn em.module_;
-  }
-
-let rename_types rn m =
-  let ty_var = phrase rn in
-
-  let block_type = function
-    | VarBlockType tv -> VarBlockType (ty_var tv)
-    | ValBlockType vto -> ValBlockType vto in
-
-  let rec instr' = function
-    | CallIndirect (table_index, tv) -> CallIndirect (table_index, (ty_var tv))
-    | Block (bty, is) -> Block (block_type bty, instrs is)
-    | Loop (bty, is) -> Loop (block_type bty, instrs is)
-    | If (bty, is1, is2) -> If (block_type bty, instrs is1, instrs is2)
-    | i -> i
-  and instr i = phrase instr' i
-  and instrs is = List.map instr is in
-
-  let func' f = { f with ftype = ty_var f.ftype; body = instrs f.body } in
-  let func = phrase func' in
-  let funcs = List.map func in
-
-  let idesc' = function
-    | FuncImport tv -> FuncImport (ty_var tv)
-    | id -> id in
-  let idesc = phrase idesc' in
-  let import' i = { i with idesc = idesc i.idesc } in
-  let import = phrase import' in
-  let imports = List.map import in
-
-  { m with
-    funcs = funcs m.funcs;
-    imports = imports m.imports;
+    module_ = remap_module_indices remapping em.module_;
+    name = rename_funcs_name_section remapping.function_index em.name;
   }
 
 (* Setting and getting top-level module data *)
@@ -1074,12 +1184,20 @@ let link (em1 : extended_module) libname (em2 : extended_module) =
 
   (* Rename types in first module *)
   let em1_tys =
-    map_module (fun m -> { (rename_types (ty_renamer m.types) m) with types = [] }) em1
+    map_module (fun m ->
+      let remapping =
+        { identity_index_remapping with type_index = ty_renamer m.types }
+      in
+      { (remap_module_indices remapping m) with types = [] }
+    ) em1
   in
 
   (* Rename types in second module *)
   let dm2 =
-    { (rename_types (ty_renamer dm2.types) dm2) with types = [] }
+    let remapping =
+      { identity_index_remapping with type_index = ty_renamer dm2.types }
+    in
+    { (remap_module_indices remapping dm2) with types = [] }
   in
 
   (* Generate type section for the final module *)
@@ -1167,8 +1285,11 @@ let link (em1 : extended_module) libname (em2 : extended_module) =
     |> map_module (remove_imports is_fun_import fun_resolved12)
     |> map_name_section (remove_fun_imports_name_section fun_resolved12)
     |> map_module (remove_imports is_global_import global_resolved12)
-    |> rename_funcs_extended funs1
-    |> rename_globals_extended globals1
+    |> remap_extended_indices
+         { identity_index_remapping with
+           function_index = funs1;
+           global_index = globals1;
+         }
     |> map_module (set_global heap_global new_heap_start)
     |> map_module (set_memory_size (I64_convert.extend_i32_u new_heap_start))
     |> map_module (set_table_size new_table_size)
@@ -1179,8 +1300,11 @@ let link (em1 : extended_module) libname (em2 : extended_module) =
     |> remove_imports is_global_import global_resolved21
     |> remove_imports is_memory_import [0l, 0l]
     |> remove_imports is_table_import [0l, 0l]
-    |> rename_funcs funs2
-    |> rename_globals globals2
+    |> remap_module_indices
+         { identity_index_remapping with
+           function_index = funs2;
+           global_index = globals2;
+         }
     |> remove_export is_fun_export "__wasm_call_ctors"
     |> remove_export is_fun_export "__wasm_apply_data_relocs"
     )
@@ -1218,3 +1342,15 @@ let link (em1 : extended_module) libname (em2 : extended_module) =
   let final = replace_got_imports lib_heap_start table_size got_imports merged.module_ in
 
   { merged with module_ = final }
+
+module For_testing = struct
+  let remap_module_indices
+      ?(type_index = identity_index)
+      ?(function_index = identity_index)
+      ?(global_index = identity_index)
+      module_ =
+    remap_module_indices { type_index; function_index; global_index } module_
+
+  let rename_funcs_name_section ~function_index =
+    rename_funcs_name_section function_index
+end

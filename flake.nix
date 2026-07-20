@@ -205,6 +205,14 @@
       };
 
       js = import ./nix/moc.js.nix { inherit pkgs commonBuildInputs rts; };
+      js-fast = import ./nix/moc.js.nix {
+        inherit pkgs commonBuildInputs;
+        rts = rts-set.build;
+      };
+      moc-wasm = import ./nix/moc.wasm.nix {
+        inherit pkgs commonBuildInputs;
+        rts = rts-set.build;
+      };
 
       docs = import ./nix/docs.nix { inherit pkgs js base-src core-src; };
 
@@ -242,7 +250,7 @@
         release = buildableReleaseMoPackages;
         debug = buildableDebugMoPackages;
 
-        inherit nix-update tests js test-runner rts-checked;
+        inherit nix-update tests js js-fast moc-wasm test-runner rts-checked;
 
         inherit (pkgs) nix-build-uncached ic-wasm pocket-ic;
 

@@ -40,6 +40,7 @@ let () =
       method parseCandid s = js_parse_candid s
       method parseMotoko enableRecovery s = js_parse_motoko enableRecovery s
       method parseMotokoWithDeps enableRecovery path s = js_parse_motoko_with_deps enableRecovery path s
+      method inspectMotoko path s = js_inspect_motoko path s
       (* The method [parseMotokoTyped] is saved for backward compability.
          New versions of tooling should use [parseMotokoTypedWithScopeCache]. *)
       method parseMotokoTyped paths = js_parse_motoko_typed paths

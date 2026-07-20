@@ -39,7 +39,9 @@ type 'a result = ('a * messages, messages) Stdlib.result
 let return x = Ok (x, [])
 
 let info at cat text = Ok ((), [info_message at cat text])
-let warn at code cat text = Ok ((), [warning_message at code cat text])
+let warn at code cat text =
+  if Flags.is_warning_disabled code then return () else
+  Ok ((), [warning_message at code cat text])
 let error at code cat text = Stdlib.Error [error_message at code cat text]
 
 let map f = function
@@ -58,17 +60,36 @@ module Syntax = struct
   let (let*) = bind
 end
 
-let rec traverse : ('a -> 'b result) -> 'a list -> 'b list result = fun f -> function
-  | [] -> return []
-  | x :: xs -> bind (f x) (fun y -> map (fun ys -> y :: ys) (traverse f xs))
+let traverse : ('a -> 'b result) -> 'a list -> 'b list result = fun f xs ->
+  let rec go rev_values rev_msgs = function
+    | [] -> Ok (List.rev rev_values, List.rev rev_msgs)
+    | x :: rest ->
+      match f x with
+      | Stdlib.Error msgs -> Stdlib.Error (List.rev_append rev_msgs msgs)
+      | Ok (value, msgs) ->
+        go (value :: rev_values) (List.rev_append msgs rev_msgs) rest
+  in
+  go [] [] xs
 
-let rec traverse_ : ('a -> unit result) -> 'a list -> unit result = fun f -> function
-  | [] -> return ()
-  | x :: xs -> bind (f x) (fun () -> traverse_ f xs)
+let traverse_ : ('a -> unit result) -> 'a list -> unit result = fun f xs ->
+  let rec go rev_msgs = function
+    | [] -> Ok ((), List.rev rev_msgs)
+    | x :: rest ->
+      match f x with
+      | Stdlib.Error msgs -> Stdlib.Error (List.rev_append rev_msgs msgs)
+      | Ok ((), msgs) -> go (List.rev_append msgs rev_msgs) rest
+  in
+  go [] xs
 
-let rec fold : ('a -> 'b -> 'a result) -> 'a -> 'b list -> 'a result = fun f acc -> function
-  | [] -> return acc
-  | x :: xs -> bind (f acc x) (fun y -> fold f y xs)
+let fold : ('a -> 'b -> 'a result) -> 'a -> 'b list -> 'a result = fun f init xs ->
+  let rec go acc rev_msgs = function
+    | [] -> Ok (acc, List.rev rev_msgs)
+    | x :: rest ->
+      match f acc x with
+      | Stdlib.Error msgs -> Stdlib.Error (List.rev_append rev_msgs msgs)
+      | Ok (next, msgs) -> go next (List.rev_append msgs rev_msgs) rest
+  in
+  go init [] xs
 
 type msg_store = messages ref
 let add_msg s m =

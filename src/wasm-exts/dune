@@ -1,5 +1,13 @@
 (library
   (name wasm_exts)
+  (modules (:standard \ test_customModuleEncode))
   (libraries wasm yojson lib prelude mo_config lang_utils)
   (instrumentation (backend bisect_ppx --bisect-silent yes))
+)
+
+(test
+  (name test_customModuleEncode)
+  (modules test_customModuleEncode)
+  (modes byte)
+  (libraries wasm_exts yojson mo_config)
 )

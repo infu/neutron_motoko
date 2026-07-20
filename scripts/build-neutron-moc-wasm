@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+out_dir="${1:-"$repo_root/_out/neutron-motoko-wasm"}"
+
+nix_out="$(nix build "path:$repo_root#moc-wasm" --no-link --print-out-paths)"
+asset_dir="moc_wasm.bc.wasm.assets"
+
+if [[ -d "$out_dir" ]]; then
+  chmod -R u+w "$out_dir"
+fi
+rm -rf "$out_dir"
+mkdir -p "$out_dir"
+
+install -m 0644 "$nix_out/bin/moc.wasm.js" "$out_dir/moc.wasm.js"
+install -m 0644 "$nix_out/bin/moc.wasm.js" "$out_dir/moc.wasm.cjs"
+# The generated Node path follows require.main. Neutron loads the compiler from
+# a service entrypoint one directory above, so retain the vendored loader's
+# established sidecar lookup relative to the CJS file itself.
+sed -E -i 's/[[:alnum:]_$]+\.dirname\(require\.main\.filename\)/__dirname/' \
+  "$out_dir/moc.wasm.cjs"
+cp -R "$nix_out/bin/$asset_dir" "$out_dir/$asset_dir"
+find "$out_dir/$asset_dir" -type f -exec chmod 0644 {} +
+
+(
+  cd "$out_dir"
+  sha256sum "moc.wasm.js" "moc.wasm.cjs" "$asset_dir"/* > SHA256SUMS
+)
+
+cat > "$out_dir/manifest.json" <<JSON
+{
+  "name": "@neutron/motoko-wasm",
+  "source": "$nix_out",
+  "loader": "moc.wasm.js",
+  "assets": "$asset_dir"
+}
+JSON
+
+printf 'Exported neutron Motoko Wasm compiler to %s\n' "$out_dir"
+printf 'Copy this directory into the Neutron compiler package when updating the vendored compiler.\n'

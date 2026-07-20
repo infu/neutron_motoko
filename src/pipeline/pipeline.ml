@@ -847,8 +847,8 @@ let adjust_flags () =
    into a list of imported libs and (compiled) classes *)
 let rec compile_libs mode libs : Lowering.Desugar.import_declaration =
   let open Source in
-  let rec go imports = function
-    | [] -> imports
+  let rec go rev_imports = function
+    | [] -> List.rev rev_imports
     | l :: libs ->
       let { Syntax.body = cub; _ } = l.it in
       let filename = l.note.Syntax.filename in
@@ -857,12 +857,13 @@ let rec compile_libs mode libs : Lowering.Desugar.import_declaration =
           match cub.it with
           | Syntax.ActorClassU _ ->
             (* Okay to "run" here, as `compile_unit_to_wasm` only fails on Syntax.MixinU *)
+            let imports = List.rev rev_imports in
             let wasm = Diag.run (compile_unit_to_wasm mode None imports l) in
             Lowering.Desugar.import_compiled_class l wasm
           | _ ->
             Lowering.Desugar.import_unit l)
       in
-      go (imports @ new_imports) libs
+      go (List.rev_append new_imports rev_imports) libs
   in go [] libs
 
 and compile_unit mode (enhanced_migration:string option) do_link imports u : Wasm_exts.CustomModule.extended_module Diag.result =
@@ -882,7 +883,7 @@ and compile_unit mode (enhanced_migration:string option) do_link imports u : Was
 and compile_unit_to_wasm mode (enhanced_migration:string option) imports (u : Syntax.comp_unit) : string Diag.result =
   let open Diag.Syntax in
   let* wasm_mod = compile_unit mode enhanced_migration true imports u in
-  let (_source_map, wasm) = Wasm_exts.CustomModuleEncode.encode wasm_mod in
+  let wasm = Wasm_exts.CustomModuleEncode.encode_wasm wasm_mod in
   Diag.return wasm
 
 and compile_progs mode do_link libs progs : Wasm_exts.CustomModule.extended_module Diag.result =

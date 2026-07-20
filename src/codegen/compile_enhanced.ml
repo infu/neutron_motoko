@@ -2030,7 +2030,7 @@ module Tagged = struct
   (* Note: post-allocation barrier must be applied after initialization *)
   let alloc env size tag =
     assert (size > 1L);
-    let name = Printf.sprintf "alloc_size<%d>_tag<%d>" (Int64.to_int size) (Int64.to_int (int_of_tag tag)) in
+    let name = Printf.sprintf "alloc_size<%Ld>_tag<%Ld>" size (int_of_tag tag) in
 
     Func.share_code0 Func.Never env name [I64Type] (fun env ->
       let set_object, get_object = new_local env "new_object" in

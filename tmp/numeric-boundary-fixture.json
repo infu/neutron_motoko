@@ -1,0 +1,4 @@
+{
+  "modules": [],
+  "neutron": "shared({caller = _installer}) persistent actor class Class<system>() = this {\n  public query func nat32_high_values() : async (Nat32, Nat32, Nat32) {\n    let max : Nat32 = 4294967295;\n    let high : Nat32 = 2147483648;\n    let low : Nat32 = 2147483647;\n    (max, high, low)\n  };\n  public query func int32_edges() : async (Int32, Int32, Int32) {\n    let min : Int32 = -2147483648;\n    let max : Int32 = 2147483647;\n    let neg : Int32 = -1;\n    (min, max, neg)\n  };\n  public query func nat32_bit_ops(x : Nat32) : async Nat32 {\n    ((x << 31) >> 1) | 2147483648\n  };\n  public query func bytes() : async Blob {\n    \"\\00\\7f\\80\\ff\"\n  };\n}\n"
+}

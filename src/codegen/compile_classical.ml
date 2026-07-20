@@ -815,11 +815,12 @@ let compile_eq64_const i =
 
 let bytes_of_int32 (i : int32) : string =
   let b = Buffer.create 4 in
-  let i = Int32.to_int i in
-  Buffer.add_char b (Char.chr (i land 0xff));
-  Buffer.add_char b (Char.chr ((i lsr 8) land 0xff));
-  Buffer.add_char b (Char.chr ((i lsr 16) land 0xff));
-  Buffer.add_char b (Char.chr ((i lsr 24) land 0xff));
+  let byte shift =
+    Int32.(to_int (logand (shift_right_logical i shift) 0xffl)) in
+  Buffer.add_char b (Char.chr (byte 0));
+  Buffer.add_char b (Char.chr (byte 8));
+  Buffer.add_char b (Char.chr (byte 16));
+  Buffer.add_char b (Char.chr (byte 24));
   Buffer.contents b
 
 (* A common variant of todo *)
@@ -2717,8 +2718,9 @@ module BoxedSmallWord = struct
   let payload_field env = Tagged.header_size env
 
   let vanilla_lit env pty i =
-    if BitTagged.can_tag_const pty (Int64.of_int (Int32.to_int i))
-    then BitTagged.tag_const pty (Int64.of_int (Int32.to_int i))
+    let i64 = Wasm.I64_convert.extend_i32_s i in
+    if BitTagged.can_tag_const pty i64
+    then BitTagged.tag_const pty i64
     else
       Tagged.shared_static_obj env (heap_tag env pty) StaticBytes.[
         I32 i

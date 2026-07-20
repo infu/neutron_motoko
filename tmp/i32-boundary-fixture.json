@@ -1,0 +1,4 @@
+{
+  "modules": [],
+  "neutron": "shared({caller = _installer}) persistent actor class Class<system>() = this {\n  public query func max_nat32() : async Nat32 { 4294967295 };\n  public query func min_int32() : async Int32 { -2147483648 };\n  public query func high_bit_blob() : async Blob { \"\\ff\\00\\00\\80\" };\n}\n"
+}

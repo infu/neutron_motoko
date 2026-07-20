@@ -2,7 +2,7 @@
 This module provides some convenience to assemble WASM instruction lists. The
 features are
 
- * O(1) concatenation (using difference list internally)
+ * O(1) concatenation (using an explicit append tree internally)
  * Managing of label depths.
  * Some simple peephole optimizations.
 *)
@@ -23,6 +23,15 @@ let combine_shifts const op = function
       Some [{const with it = Const {cl with it = I64 (Int64.add l' r')}}; {op with it = Binary (I64 opl)}]
     else None
   | _ -> None
+
+let dwarf_like_instrs is =
+  let rec collect found = function
+    | [] -> List.rev found
+    | instr :: rest when Wasm_exts.Ast.is_dwarf_like instr.it ->
+      collect (instr :: found) rest
+    | _ :: rest -> collect found rest
+  in
+  collect [] is
 
 (* Some simple peephole optimizations, to make the output code look less stupid *)
 (* This uses a zipper.*)
@@ -65,7 +74,7 @@ let optimize : instr list -> instr list = fun is ->
     (* Code after Return, Br, BrTable or Unreachable is dead *)
     | _, ({ it = Return | Br _ | BrTable _ | Unreachable; _ } as i) :: t ->
       (* see Note [funneling DIEs through Wasm.Ast] *)
-      List.(rev (i :: l) @ find_all (fun instr -> Wasm_exts.Ast.is_dwarf_like instr.it) t)
+      List.rev_append (i :: l) (dwarf_like_instrs t)
     (* Equals zero has a dedicated operation (and works well with leg swapping) *)
     | ({it = Compare (I32 I32Op.Eq); _} as i) :: {it = Const {it = I32 0l; _}; _} :: l', r' ->
       go l' ({ i with it = Test (I32 I32Op.Eqz)} :: r')
@@ -177,65 +186,181 @@ let optimize : instr list -> instr list = fun is ->
     | l, [] -> List.rev l
   in go [] is
 
-(* The main type of this module:
-   Arguments for the current depth and the current source region,
-   and producing a difference list *)
-type t = int32 -> Wasm.Source.region -> instr list -> instr list
+(* Remembered label depths are promises because builders can refer to a label
+   before the instruction tree is materialized. *)
+type depth = int32 Lib.Promise.t
+
+(* The main type of this module is an explicit instruction-builder tree.
+
+   In particular, [Append] replaces the old functional difference list.  A
+   long chain of [(^^)] therefore allocates ordinary data instead of a chain of
+   function calls that consumes the native or wasm_of_ocaml stack when it is
+   materialized.  The structured nodes defer region and label-depth handling
+   until the iterative materializer below. *)
+type t =
+  | Empty
+  | Leaf of instr'
+  | Append of t * t
+  | WithRegion of Source.region * t
+  | IfNode of block_type * t * t
+  | BlockNode of block_type * t
+  | LoopNode of t
+  | RememberDepth of depth * t
+  | BranchTo of depth
+
+(* Completion frames keep nested wasm bodies off the OCaml call stack too.
+   Each saved instruction list is in reverse emission order. *)
+type materialize_frame =
+  | Emit of int32 * Source.region * t
+  | FinishBlock of instr list * Source.region * block_type
+  | FinishLoop of instr list * Source.region
+  | FinishThen of instr list * int32 * Source.region * block_type * t
+  | FinishIf of instr list * Source.region * block_type * instr list
+
+let optimized_reversed is =
+  optimize (List.rev is)
+
+(* Materialize a builder without optimizing its top-level instruction list.
+   Nested wasm bodies are still optimized, matching the old combinators: they
+   called [to_nested_list] before returning their enclosing instruction. *)
+let materialize_raw_at depth pos (is : t) : instr list =
+  let rec run emitted = function
+    | [] -> List.rev emitted
+    | Emit (_, _, Empty) :: work ->
+      run emitted work
+    | Emit (d, at, Leaf instr) :: work ->
+      run ((instr @@ at) :: emitted) work
+    | Emit (d, at, Append (left, right)) :: work ->
+      run emitted (Emit (d, at, left) :: Emit (d, at, right) :: work)
+    | Emit (d, _, WithRegion (at, body)) :: work ->
+      run emitted (Emit (d, at, body) :: work)
+    | Emit (d, at, BlockNode (ty, body)) :: work ->
+      run []
+        (Emit (Int32.add d 1l, at, body) ::
+         FinishBlock (emitted, at, ty) :: work)
+    | FinishBlock (parent, at, ty) :: work ->
+      let body = optimized_reversed emitted in
+      run ((Block (ty, body) @@ at) :: parent) work
+    | Emit (d, at, LoopNode body) :: work ->
+      run []
+        (Emit (Int32.add d 1l, at, body) ::
+         FinishLoop (emitted, at) :: work)
+    | FinishLoop (parent, at) :: work ->
+      let body = optimized_reversed emitted in
+      run ((Loop (ValBlockType None, body) @@ at) :: parent) work
+    | Emit (d, at, IfNode (ty, thn, els)) :: work ->
+      run []
+        (Emit (Int32.add d 1l, at, thn) ::
+         FinishThen (emitted, d, at, ty, els) :: work)
+    | FinishThen (parent, d, at, ty, els) :: work ->
+      let thn = optimized_reversed emitted in
+      run []
+        (Emit (Int32.add d 1l, at, els) ::
+         FinishIf (parent, at, ty, thn) :: work)
+    | FinishIf (parent, at, ty, thn) :: work ->
+      let els = optimized_reversed emitted in
+      run ((If (ty, thn, els) @@ at) :: parent) work
+    | Emit (d, at, RememberDepth (label, body)) :: work ->
+      (* This must happen before [body] is put at the head of the work list:
+         it may start with a [BranchTo] that reads the promise. *)
+      Lib.Promise.fulfill label d;
+      run emitted (Emit (d, at, body) :: work)
+    | Emit (d, at, BranchTo label) :: work ->
+      let relative_depth = Int32.sub d (Lib.Promise.value label) in
+      run ((Br (relative_depth @@ at) @@ at) :: emitted) work
+  in
+  run [] [Emit (depth, pos, is)]
+
+let materialize_raw is =
+  materialize_raw_at 0l Wasm.Source.no_region is
+
+let materialize_optimized_at depth pos is =
+  optimize (materialize_raw_at depth pos is)
 
 let to_instr_list (is : t) : instr list =
-  optimize (is 0l Wasm.Source.no_region [])
+  materialize_optimized_at 0l Wasm.Source.no_region is
 
 let to_nested_list d pos is =
-  optimize (is Int32.(add d 1l) pos [])
+  materialize_optimized_at Int32.(add d 1l) pos is
 
 
 (* Do nothing *)
-let nop : t = fun _ _ rest -> rest
+let nop : t = Empty
 
 (* The concatenation operator *)
-let (^^) (is1 : t) (is2 : t) : t = fun d pos rest -> is1 d pos (is2 d pos rest)
+let (^^) (is1 : t) (is2 : t) : t =
+  match is1, is2 with
+  | Empty, is | is, Empty -> is
+  | _ -> Append (is1, is2)
 
 (* Singletons *)
-let i (instr : instr') : t = fun _ pos rest -> (instr @@ pos) :: rest
+let i (instr : instr') : t = Leaf instr
 
-(* map and concat *)
-let concat xs = List.fold_right (^^) xs nop
-let concat_map f xs = List.fold_right (^^) (List.map f xs) nop
-let concat_mapi f xs = List.fold_right (^^) (List.mapi f xs) nop
-let table n f = List.fold_right (^^) (Lib.List.table n f) nop
+(* Map and concatenate without an intermediate mapped list or a recursive
+   [fold_right].  These loops evaluate mapping functions in the same order as
+   their former list-building counterparts. *)
+let concat xs =
+  let rec go acc = function
+    | [] -> acc
+    | is :: rest -> go (acc ^^ is) rest
+  in
+  go nop xs
+
+let concat_map f xs =
+  let rec go acc = function
+    | [] -> acc
+    | x :: rest ->
+      let is = f x in
+      go (acc ^^ is) rest
+  in
+  go nop xs
+
+let concat_mapi f xs =
+  let rec go index acc = function
+    | [] -> acc
+    | x :: rest ->
+      let is = f index x in
+      go (index + 1) (acc ^^ is) rest
+  in
+  go 0 nop xs
+
+let table n f =
+  (* [Lib.List.table] used to call [f] from [n - 1] down to zero while
+     returning the fragments in ascending order.  Preserve both properties. *)
+  let rec go index acc =
+    if index < 0 then acc else
+      let is = f index in
+      go (index - 1) (is ^^ acc)
+  in
+  if n <= 0 then nop else go (n - 1) nop
 
 (* Region-managing combinator *)
 
 let with_region (pos : Source.region) (body : t) : t =
-  fun d _pos rest -> body d pos rest
+  WithRegion (pos, body)
 
 (* Depths-managing combinators *)
 
 let if_ (ty : block_type) (thn : t) (els : t) : t =
-  fun d pos rest ->
-    (If (ty, to_nested_list d pos thn, to_nested_list d pos els) @@ pos) :: rest
+  IfNode (ty, thn, els)
 
 (* Shortcuts for unary and nullary variants *)
 let if0 = if_ (ValBlockType None)
 let if1 ty = if_ (ValBlockType (Some ty))
 
 let block_ (ty : block_type) (body : t) : t =
-  fun d pos rest ->
-    (Block (ty, to_nested_list d pos body) @@ pos) :: rest
+  BlockNode (ty, body)
 let block0 = block_ (ValBlockType None)
 let block1 ty = block_ (ValBlockType (Some ty))
 
 let loop0 (body : t) : t =
-  fun d pos rest ->
-    (Loop (ValBlockType None, to_nested_list d pos body) @@ pos) :: rest
+  LoopNode body
 
 (* Remember depth *)
-type depth = int32 Lib.Promise.t
-
 let new_depth_label () : depth =  Lib.Promise.make ()
 
 let remember_depth depth (is : t) : t =
-  fun d rest -> Lib.Promise.fulfill depth d; is d rest
+  RememberDepth (depth, is)
 
 let with_current_depth (k : depth -> t) : t =
   let depth = new_depth_label () in
@@ -247,8 +372,7 @@ let with_current_depth' (k : depth -> ('a * t)) : ('a * t) =
   (x, remember_depth depth is)
 
 let branch_to_ (p : depth) : t =
-  fun d pos rest ->
-    (Br (Int32.(sub d (Lib.Promise.value p)) @@ pos) @@ pos) :: rest
+  BranchTo p
 
 (* Convenience combinators *)
 
@@ -258,15 +382,15 @@ let labeled_block1 ty depth (body : t) : t =
 (* Obtain the setter from a known variable's getter *)
 
 let setter_for (getter : t) =
-  match List.map (fun {it; _} -> it) (getter 0l Wasm.Source.no_region []) with
-  | [LocalGet v] -> i (LocalSet v)
-  | [GlobalGet v] -> i (GlobalSet v)
+  match materialize_raw getter with
+  | [{it = LocalGet v; _}] -> i (LocalSet v)
+  | [{it = GlobalGet v; _}] -> i (GlobalSet v)
   | _ -> failwith "input must be a getter"
 
 (* Intended to be used within assert *)
 
 let is_nop (is : t) =
-  is 0l Wasm.Source.no_region [] = []
+  materialize_raw is = []
 
 (* DWARF tags and attributes: see Note [funneling DIEs through Wasm.Ast] *)
 

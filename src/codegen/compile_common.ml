@@ -12,8 +12,8 @@ let (@@) = Stdlib.(@@)
 module G = InstrList
 let (^^) = G.(^^) (* is this how we import a single operator from a module that we otherwise use qualified? *)
 
-(* Our code depends on OCaml int having at least 32 bits *)
-let _ = assert (Sys.int_size >= 32)
+(* Keep this module usable with wasm_of_ocaml, whose host OCaml integers are
+   31-bit. Code that needs full Wasm i32 payloads must stay in int32/int64. *)
 
 (* Generating function names for functions parametrized by prim types *)
 let prim_fun_name p stem = Printf.sprintf "%s<%s>" stem (Type.string_of_prim p)

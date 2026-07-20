@@ -126,10 +126,10 @@ let put s b = Buffer.add_char s.buf b
 let put_string s bs = Buffer.add_string s.buf bs
 let patch s pos b = s.patches := (pos, b) :: !(s.patches)
 
-let to_string s =
+let to_bytes s =
   let bs = Buffer.to_bytes s.buf in
   List.iter (fun (pos, b) -> Bytes.set bs pos b) !(s.patches);
-  Bytes.to_string bs
+  bs
 
 module References = Map.Make (struct type t = int let compare = compare end)
 
@@ -143,48 +143,180 @@ let promise_reference_slot p =
 let allocate_reference_slot () =
   promise_reference_slot (Promise.make ())
 
+module For_testing = struct
+  type counters = {
+    source_loads : int;
+    map_serializations : int;
+  }
+
+  type active_counters = {
+    mutable observed_source_loads : int;
+    mutable observed_map_serializations : int;
+  }
+
+  let active = ref None
+
+  let observe f =
+    if Option.is_some !active then invalid_arg "nested encoder observation";
+    let counters : active_counters =
+      {observed_source_loads = 0; observed_map_serializations = 0} in
+    active := Some counters;
+    Fun.protect
+      ~finally:(fun () -> active := None)
+      (fun () ->
+        let result = f () in
+        let snapshot : counters =
+          { source_loads = counters.observed_source_loads;
+            map_serializations = counters.observed_map_serializations } in
+        result, snapshot)
+
+  let note_source_load () =
+    Option.iter
+      (fun counters ->
+        counters.observed_source_loads <- counters.observed_source_loads + 1)
+      !active
+
+  let note_map_serialization () =
+    Option.iter
+      (fun counters ->
+        counters.observed_map_serializations <-
+          counters.observed_map_serializations + 1)
+      !active
+end
+
+module Instrs = Set.Make (struct
+  type t = int * Source.pos
+  let compare = compare
+end)
+
+module DW_Sequence = Set.Make (struct
+  type t = int * Instrs.t * int
+  let compare = compare
+end)
+
+type source_map_state = {
+  mappings : Buffer.t;
+  source_indices : (string, int) Hashtbl.t;
+  mutable sources_rev : string list;
+  mutable sources_content_rev : string list;
+  mutable next_source_index : int;
+  mutable prev_source_index : int;
+  mutable prev_output_line : int;
+  mutable prev_output_column : int;
+  mutable prev_input_line : int;
+  mutable prev_input_column : int;
+}
+
+type debug_state = {
+  dwarf_strings : (string * int) list ref;
+  statement_positions : Instrs.t ref;
+  sequence_bounds : DW_Sequence.t ref;
+  dwarf_tags : die list ref;
+  code_section_start : int ref;
+  sequence_number : int ref;
+  subprogram_sizes : int array Promise.t;
+  rangelists : int Promise.t;
+  source_names : ((string * int) * (int Promise.t * int)) list ref;
+  dir_names : (string * (int Promise.t * int)) list ref;
+  source_path_indices : (string * int) list ref;
+  info_section_start : int ref;
+  dw_patches : (unit -> unit) ref;
+}
+
+let create_source_map_state () = {
+  mappings = Buffer.create 0;
+  source_indices = Hashtbl.create 32;
+  sources_rev = [];
+  sources_content_rev = [];
+  next_source_index = 0;
+  prev_source_index = 0;
+  prev_output_line = 0;
+  prev_output_column = 0;
+  prev_input_line = 0;
+  prev_input_column = 0;
+}
+
+let create_debug_state () =
+  let here_dir, asset_dir = 0, 1 in
+  let source_names =
+    [ "prelude", (Promise.make (), asset_dir)
+    ; "prim", (Promise.make (), asset_dir)
+    ; "internals", (Promise.make (), asset_dir)
+    ; "timers-api", (Promise.make (), asset_dir)
+    ; "rts.wasm", (Promise.make (), asset_dir) ] in
+  let source_names =
+    List.map (fun (name, ((_, index) as entry)) -> (name, index), entry) source_names in
+  let source_path_indices =
+    let count = List.length source_names in
+    List.mapi (fun index ((path, _), _) -> path, count - 1 - index) source_names in
+  {
+    dwarf_strings = ref [];
+    statement_positions = ref Instrs.empty;
+    sequence_bounds = ref DW_Sequence.empty;
+    dwarf_tags = ref [Tag (None, 0, [])];
+    code_section_start = ref 0;
+    sequence_number = ref 0;
+    subprogram_sizes = Promise.make ();
+    rangelists = Promise.make ();
+    source_names = ref source_names;
+    dir_names = ref
+      [ "<moc-asset>", (Promise.make (), asset_dir)
+      ; Filename.dirname "", (Promise.make (), here_dir) ];
+    source_path_indices = ref source_path_indices;
+    info_section_start = ref 0;
+    dw_patches = ref Fun.id;
+  }
+
 (* Encoding *)
 
-let encode (em : extended_module) =
+let encode_internal ~emit_source_map (em : extended_module) =
+  let emit_debug_info = !Mo_config.Flags.debug_info in
   let s = stream () in
 
-  (* source map *)
-  let map = Buffer.create 0 in
-  let sources = ref [] in
-  let sourcesContent = ref [] in
-  let segs = ref 0 in
-  let prev_if = ref 0 in
-  let prev_ol = ref 0 in
-  let prev_oc = ref 0 in
-  let prev_il = ref 0 in
-  let prev_ic = ref 0 in
+  (* These modes are deliberately independent: mo-ld emits DWARF without a
+     source map, while moc --map can emit a map without DWARF. *)
+  let source_map =
+    if emit_source_map then Some (create_source_map_state ()) else None in
+  let debug =
+    if emit_debug_info then Some (create_debug_state ()) else None in
+
+  let get_debug () =
+    match debug with
+    | Some state -> state
+    | None -> assert false in
 
   (* modify reference *)
   let modif r f = r := f !r in
 
-  let rec add_source filename = function (* FIXME: use add_string *)
-    | [] ->
-      sources := !sources @ [ filename ];
-      let source_code =
-        try
-          if filename = "prelude" then Prelude.prelude else
-          if filename = "prim" then Prelude.prim_module  ~timers:!Mo_config.Flags.global_timer else
-          (*
-          Here we opportunistically see if we can find the source file
-          mentioned in the source location, and if we can, include its source
-          verbatim in the source map
-          *)
-          let ic = Stdlib.open_in filename in
-          let n = in_channel_length ic in
-          let s = Bytes.create n in
-          really_input ic s 0 n;
-          close_in ic;
-          Bytes.to_string s
-        with _ -> "" in
-      sourcesContent := !sourcesContent @ [ source_code ];
-      0
-    | h :: t -> if filename = h then 0 else 1 + add_source filename t
-  in
+  let load_source filename =
+    For_testing.note_source_load ();
+    try
+      if filename = "prelude" then Prelude.prelude else
+      if filename = "prim" then
+        Prelude.prim_module ~timers:!Mo_config.Flags.global_timer
+      else
+        (* Source content is best-effort, but an opened channel must always be
+           closed, including when length or input raises. *)
+        let ic = Stdlib.open_in filename in
+        Fun.protect
+          ~finally:(fun () -> close_in_noerr ic)
+          (fun () ->
+            let length = in_channel_length ic in
+            let contents = Bytes.create length in
+            really_input ic contents 0 length;
+            Bytes.to_string contents)
+    with _ -> "" in
+
+  let add_source state filename =
+    match Hashtbl.find_opt state.source_indices filename with
+    | Some index -> index
+    | None ->
+      let index = state.next_source_index in
+      state.next_source_index <- index + 1;
+      Hashtbl.add state.source_indices filename index;
+      state.sources_rev <- filename :: state.sources_rev;
+      state.sources_content_rev <- load_source filename :: state.sources_content_rev;
+      index in
 
   let add_string gen strings str = (* FIXME: perform suffix compression? *)
     let strs = !strings in
@@ -195,18 +327,11 @@ let encode (em : extended_module) =
       let strs' = (str, v) :: strs in strings := strs'; v
   in
 
-  let dwarf_strings = ref [] in
-
-  let add_dwarf_string =
-    add_string (function | [] -> 0 | (h, p) :: _ -> String.length h + 1 + p) dwarf_strings in
-
-  let module Instrs = Set.Make (struct type t = int * Source.pos let compare = compare end) in
-  let statement_positions = ref Instrs.empty in
-
-  let module DW_Sequence = Set.Make (struct type t = int * Instrs.t * int let compare = compare end) in
-  let sequence_bounds = ref DW_Sequence.empty in
-
-  let dwarf_tags = ref [Tag (None, 0, [])] in
+  let add_dwarf_string str =
+    let state = get_debug () in
+    add_string
+      (function | [] -> 0 | (head, position) :: _ -> String.length head + 1 + position)
+      state.dwarf_strings str in
 
   let is_closed tag =
     let tag_of (t', _, _) = tag = t' in
@@ -214,18 +339,17 @@ let encode (em : extended_module) =
     not (has_children <> 0)
   in
 
-  let code_section_start = ref 0 in
-
   let add_dwarf_tag refi tag =
+    let state = get_debug () in
     let position_attr =
       if tag = Dwarf5.dw_TAG_lexical_block then
-        [IntAttribute (Dwarf5.dw_AT_low_pc, pos s - !code_section_start)]
+        [IntAttribute (Dwarf5.dw_AT_low_pc, pos s - !(state.code_section_start))]
       else [] in
 
     (* invariant: at most one closed tag waiting for attributes *)
 
-    dwarf_tags :=
-      match !dwarf_tags with
+    state.dwarf_tags :=
+      match !(state.dwarf_tags) with
       | [Tag (refi, t, viscera)] when tag = Dwarf5.dw_TAG_compile_unit && t = 0 ->
         [Tag (refi, tag, viscera)]
       | Tag (_, t', _) as closed :: Tag (r, t, arts) :: tail when is_closed t' ->
@@ -237,57 +361,54 @@ let encode (em : extended_module) =
   let hoistables = List.partition (function Tag (Some r, _, _) -> true | _ -> false) in
 
   let rec close_dwarf genuine =
+    let state = get_debug () in
     (* hoist out referencable tags,
        see Note [bubbling up types in the tag hierarchy] *)
-    begin match !dwarf_tags with
+    begin match !(state.dwarf_tags) with
     | Tag (refi, t, viscera) :: Tag (refi', t', viscera') :: tail
         when genuine && Dwarf5.(dw_TAG_subprogram = t land 0xFF || dw_TAG_lexical_block = t land 0xFF) ->
       let hoist, stay = hoistables viscera in
-      dwarf_tags := Tag (refi, t, stay) :: Tag (refi', t', hoist @ viscera') :: tail
+      state.dwarf_tags := Tag (refi, t, stay) :: Tag (refi', t', hoist @ viscera') :: tail
     | _ -> ()
     end;
 
-    match !dwarf_tags with
+    match !(state.dwarf_tags) with
     | Tag (_, t, viscera) :: tail when Dwarf5.dw_TAG_lexical_block = t && no_tags viscera ->
-      dwarf_tags := tail
+      state.dwarf_tags := tail
     | Tag (refi, t, viscera) :: tail when genuine && Dwarf5.dw_TAG_lexical_block = t ->
-      dwarf_tags := Tag (refi, t, IntAttribute (Dwarf5.dw_AT_high_pc, pos s - !code_section_start) :: viscera) :: tail;
+      state.dwarf_tags := Tag (refi, t, IntAttribute (Dwarf5.dw_AT_high_pc, pos s - !(state.code_section_start)) :: viscera) :: tail;
       close_dwarf false
     | [] -> failwith "no open DW_TAG"
     | [Tag (None, t, viscera)] when Dwarf5.dw_TAG_compile_unit = t ->
-      dwarf_tags := Tag (None, t, viscera) :: []
+      state.dwarf_tags := Tag (None, t, viscera) :: []
     | [Tag _] -> failwith "TOPLEVEL: NOT NESTING"
     | Tag (_, t', _) as closed :: Tag (r, t, arts) :: tail when is_closed t' ->
-      dwarf_tags := Tag (r, t, closed :: arts) :: tail; close_dwarf genuine
+      state.dwarf_tags := Tag (r, t, closed :: arts) :: tail; close_dwarf genuine
     | Tag (_, t', _) as nested :: Tag (r, tag, arts) :: t ->
-      dwarf_tags := Tag (r, tag, nested :: arts) :: t
+      state.dwarf_tags := Tag (r, tag, nested :: arts) :: t
     | _ -> failwith "cannot close DW_AT" in
   let add_dwarf_attribute attr =
-    dwarf_tags := match !dwarf_tags with
+    let state = get_debug () in
+    state.dwarf_tags := match !(state.dwarf_tags) with
                   | Tag (r, tag, arts) :: t -> Tag (r, tag, attr :: arts) :: t
                   | _ -> assert false
   in
 
-  (* keeping count of the DWARF code sequence we are in *)
-  let sequence_number = ref 0 in
-  (* array of the sizes of the emitted subprograms *)
-  let subprogram_sizes = Promise.make () in
-  (* offset of the range lists section *)
-  let rangelists = Promise.make () in
-
   let extract_dwarf refi tag =
+    let state = get_debug () in
     let open Dwarf5 in
     let extract = function
       | OffsetAttribute at when at = dw_AT_low_pc && tag = dw_TAG_compile_unit ->
         add_dwarf_attribute (IntAttribute (at, 0))
       | OffsetAttribute at when at = dw_AT_low_pc && tag land 0xFF = dw_TAG_subprogram ->
-        add_dwarf_attribute (IntAttribute (at, !sequence_number))
+        add_dwarf_attribute (IntAttribute (at, !(state.sequence_number)))
       | OffsetAttribute at when at = dw_AT_high_pc && tag land 0xFF = dw_TAG_subprogram ->
-        let s = !sequence_number in
-        let resolve () = IntAttribute (at, Array.get (Promise.value subprogram_sizes) s) in
+        let sequence = !(state.sequence_number) in
+        let resolve () =
+          IntAttribute (at, Array.get (Promise.value state.subprogram_sizes) sequence) in
         add_dwarf_attribute (FutureAttribute resolve)
       | OffsetAttribute at when at = dw_AT_ranges ->
-        let resolve () = IntAttribute (at, Promise.value rangelists) in
+        let resolve () = IntAttribute (at, Promise.value state.rangelists) in
         add_dwarf_attribute (FutureAttribute resolve) (* see Note [Low_pc, High_pc, Ranges are special] *)
       | (IntAttribute _ | StringAttribute _) as attr ->
         add_dwarf_attribute attr
@@ -297,17 +418,23 @@ let encode (em : extended_module) =
     List.iter extract
   in
 
-  let add_to_map file il ic ol oc =
-    let il = il - 1 in
-    let if_ = add_source file !sources in
-    if ol <> !prev_ol then Buffer.add_char map ';';
-    Vlq_base64.encode map (oc - !prev_oc);             (* output column *)
-    Vlq_base64.encode map (if_ - !prev_if);            (* sources index *)
-    Vlq_base64.encode map (il - !prev_il);             (* input row *)
-    Vlq_base64.encode map (ic - !prev_ic);             (* input column *)
-    Buffer.add_char map ',';
-
-    prev_if := if_; prev_ol := ol; prev_oc := oc; prev_il := il; prev_ic := ic; incr segs
+  let add_to_map file input_line input_column output_line output_column =
+    match source_map with
+    | None -> ()
+    | Some state ->
+      let input_line = input_line - 1 in
+      let source_index = add_source state file in
+      if output_line <> state.prev_output_line then Buffer.add_char state.mappings ';';
+      Vlq_base64.encode state.mappings (output_column - state.prev_output_column);
+      Vlq_base64.encode state.mappings (source_index - state.prev_source_index);
+      Vlq_base64.encode state.mappings (input_line - state.prev_input_line);
+      Vlq_base64.encode state.mappings (input_column - state.prev_input_column);
+      Buffer.add_char state.mappings ',';
+      state.prev_source_index <- source_index;
+      state.prev_output_line <- output_line;
+      state.prev_output_column <- output_column;
+      state.prev_input_line <- input_line;
+      state.prev_input_column <- input_column
   in
 
   let module E = struct
@@ -317,7 +444,7 @@ let encode (em : extended_module) =
     let u16 i = u8 (i land 0xff); u8 (i lsr 8)
     let u32 i =
       Int32.(u16 (to_int (logand i 0xffffl));
-             u16 (to_int (shift_right i 16)))
+             u16 (to_int (logand (shift_right_logical i 16) 0xffffl)))
     let u64 i =
       Int64.(u32 (to_int32 (logand i 0xffffffffL));
              u32 (to_int32 (shift_right i 32)))
@@ -418,14 +545,17 @@ let encode (em : extended_module) =
       | ValBlockType (Some t) -> value_type t
 
     let rec instr noting e =
-      if e.at <> no_region then add_to_map e.at.left.file e.at.left.line e.at.left.column 0 (pos s);
-      noting e;
+      if emit_source_map && e.at <> no_region then
+        add_to_map e.at.left.file e.at.left.line e.at.left.column 0 (pos s);
+      if emit_debug_info then noting e;
       let instr = instr noting in
 
       match e.it with
+      | Meta _ when not emit_debug_info -> ()
       | Meta TagClose -> close_dwarf true
       | Meta (StatementDelimiter left) ->
-        modif statement_positions (Instrs.add (pos s, left))
+        let state = get_debug () in
+        modif state.statement_positions (Instrs.add (pos s, left))
       | Meta (Tag (r, t, attrs_tags)) ->
         let tags, attrs = List.partition (function Tag _ | Grouped _ -> true | _ -> false) attrs_tags in
         extract_dwarf r t attrs;
@@ -788,39 +918,29 @@ let encode (em : extended_module) =
 
     let local (t, n) = len n; value_type t
 
-    let (here_dir, asset_dir) = (0, 1) (* reversed indices in dir_names, below *)
-    let source_names =
-      [ "prelude", (Promise.make (), asset_dir)
-      ; "prim", (Promise.make (), asset_dir)
-      ; "internals", (Promise.make (), asset_dir)
-      ; "timers-api",  (Promise.make (), asset_dir)
-      ; "rts.wasm", (Promise.make (), asset_dir) ] (* make these appear last in .debug_line file_name_entries *)
-
-    (* Note: we use it like a key-value store and since file names are not unique, we need to add the directory index to the key *)
-    let source_names = ref (List.map (fun (n, ((_, i) as t)) -> (n, i), t) source_names)
-
-    let dir_names = (* ditto, but reversed: 6.2.4.1 Standard Content Descriptions *)
-      ref [ "<moc-asset>", (Promise.make (), asset_dir)
-          ; Filename.dirname "", (Promise.make (), here_dir) ]
-
-    (* Initialize indices for source_names *)
-    let source_path_indices =
-      let n = List.length !source_names in
-      ref (List.mapi (fun i ((p, _), (_, _)) -> p, n - 1 - i) !source_names)
     let add_source_name =
+      let asset_dir = 1 in
       let source_adder dir_index _ = Promise.make (), dir_index in
       let add_source_path_index (_, _) = function
         | "" -> assert false
         | str ->
-          ignore (add_string (function [] -> assert false | (_, i) :: _ -> i + 1) source_path_indices str) in
+          let state = get_debug () in
+          ignore (add_string
+            (function [] -> assert false | (_, index) :: _ -> index + 1)
+            state.source_path_indices str) in
       function
       | "" -> ()
       | ("prelude" | "prim" | "rts.wasm") as asset ->
-        add_source_path_index (add_string (source_adder asset_dir) source_names (asset, asset_dir)) asset
+        let state = get_debug () in
+        add_source_path_index
+          (add_string (source_adder asset_dir) state.source_names (asset, asset_dir)) asset
       | path ->
+        let state = get_debug () in
         let dir, basename = Filename.(dirname path, basename path) in
-        let _, dir_index = add_string (function [] -> assert false | (_, (_, i)) :: _ -> Promise.make (), i + 1) dir_names dir in
-        let promise = add_string (source_adder dir_index) source_names (basename, dir_index) in
+        let _, dir_index = add_string
+          (function [] -> assert false | (_, (_, index)) :: _ -> Promise.make (), index + 1)
+          state.dir_names dir in
+        let promise = add_string (source_adder dir_index) state.source_names (basename, dir_index) in
         add_source_path_index promise path
 
     let code f =
@@ -828,23 +948,40 @@ let encode (em : extended_module) =
       let g = gap32 () in
       let p = pos s in
       vec local (compress locals);
-      let instr_notes = ref Instrs.empty in
+      let instr_notes =
+        if emit_debug_info then Some (ref Instrs.empty) else None in
       let note i =
-        if not (is_dwarf_like i.it) then
-          (modif instr_notes (Instrs.add (pos s, i.at.left));
-           ignore (add_source_name i.at.left.file)
-          ) in
+        match instr_notes with
+        | Some notes when not (is_dwarf_like i.it) ->
+          modif notes (Instrs.add (pos s, i.at.left));
+          add_source_name i.at.left.file
+        | _ -> () in
       list (instr note) body;
-      modif instr_notes (Instrs.add (pos s, f.at.right));
-      ignore (add_source_name f.at.right.file);
+      begin match instr_notes with
+      | Some notes ->
+        modif notes (Instrs.add (pos s, f.at.right));
+        add_source_name f.at.right.file
+      | None -> ()
+      end;
       end_ ();
-      incr sequence_number;
       let sequence_end = pos s in
       patch_gap32 g (sequence_end - p);
-      modif sequence_bounds (DW_Sequence.add (p, !instr_notes, sequence_end))
+      begin match instr_notes with
+      | Some notes ->
+        let state = get_debug () in
+        incr state.sequence_number;
+        modif state.sequence_bounds (DW_Sequence.add (p, !notes, sequence_end))
+      | None -> ()
+      end
 
     let code_section fs =
-      section 10 (fun fs -> code_section_start := pos s; vec code fs) fs (fs <> [])
+      let body fs =
+        begin match debug with
+        | Some state -> state.code_section_start := pos s
+        | None -> ()
+        end;
+        vec code fs in
+      section 10 body fs (fs <> [])
 
     (* Element section *)
     let segment dat seg =
@@ -963,8 +1100,6 @@ let encode (em : extended_module) =
       patch s (p + 1) (lsb (n lsr 8));
       patch s (p + 2) (lsb (n lsr 16));
       patch s (p + 3) (lsb (n lsr 24))
-    let dw_patches = ref Fun.id
-
     let debug_abbrev_section () =
       let tag (t, ch, kvs) =
         uleb128 (t land 0xFFFF); u8 ch;
@@ -1011,6 +1146,7 @@ let encode (em : extended_module) =
       | f when dw_FORM_ref4 = f ->
         begin function
           | IntAttribute (attr, i) ->
+            let state = get_debug () in
             (* See Note [placeholder promises for typedefs] *)
             let placeholder_promise = References.find i !dw_references in
             assert (Promise.is_fulfilled placeholder_promise);
@@ -1018,11 +1154,11 @@ let encode (em : extended_module) =
             let offset_promise = References.find forward_ref !dw_references in
             if Promise.is_fulfilled offset_promise
             then write32 (Promise.value offset_promise)
-            else dw_patches :=
+            else state.dw_patches :=
                    (fun gap ps () ->
                      ps ();
                      dw_patch_gap32 gap (Promise.value offset_promise)
-                   ) (dw_gap32 ()) !dw_patches
+                   ) (dw_gap32 ()) !(state.dw_patches)
           | _ -> failwith "dw_FORM_ref_ref4"
         end
       | f when dw_FORM_ref_udata = f ->
@@ -1059,13 +1195,14 @@ let encode (em : extended_module) =
         end
       | _ -> failwith "cannot write form"
 
-    let info_section_start = ref 0
-
     let rec writeTag at_toplevel = function
       | Tag (r, t, contentsRevd) ->
+        let state = get_debug () in
         begin match r with
         | Some refi ->
-          Promise.fulfill (References.find refi !dw_references) (pos s - !info_section_start)
+          Promise.fulfill
+            (References.find refi !dw_references)
+            (pos s - !(state.info_section_start))
         | None -> assert (t <> Dwarf5.dw_TAG_base_type)
         end;
 
@@ -1086,9 +1223,12 @@ let encode (em : extended_module) =
             pairing (attr, form) (f ())
           | StringAttribute (a, path0) when a = Dwarf5.dw_AT_decl_file ->
             let path = if path0 = "" then "prim" else path0 in
-            if attr <> a then Printf.printf "DATA1 attr: 0x%x = a: 0x%x (in TAG 0x%x) PATH: %s  ULT: (%s, %d)\n" attr a t path    (fst (List.hd !source_path_indices)) (snd (List.hd !source_path_indices));
+            if attr <> a then Printf.printf "DATA1 attr: 0x%x = a: 0x%x (in TAG 0x%x) PATH: %s  ULT: (%s, %d)\n" attr a t path    (fst (List.hd !(state.source_path_indices))) (snd (List.hd !(state.source_path_indices)));
             assert (attr = a);
-            writeForm form (IntAttribute (a, List.(snd (hd !source_path_indices) - assoc path !source_path_indices)))
+            writeForm form
+              (IntAttribute (a,
+                List.(snd (hd !(state.source_path_indices)) -
+                      assoc path !(state.source_path_indices))))
           | IntAttribute (a, _) as art ->
             if attr <> a then Printf.printf "attr: 0x%x = a: 0x%x (in TAG 0x%x)\n" attr a t;
             assert (attr = a);
@@ -1113,21 +1253,23 @@ let encode (em : extended_module) =
       f g; dw_patch_gap32 g (pos s - p)
 
     let debug_info_section () =
+      let state = get_debug () in
       let section_body abs =
         unit(fun info_start ->
             write16 0x0005; (* version *)
             u8 Dwarf5.dw_UT_compile; (* unit_type *)
             u8 4; (* address_size *)
             write32 0x0000; (* debug_abbrev_offset *)
-            info_section_start := info_start;
+            state.info_section_start := info_start;
 
-            match !dwarf_tags with
+            match !(state.dwarf_tags) with
             | [toplevel] -> writeTag true toplevel
             | _ -> failwith "expected one toplevel tag"
         );
-        !dw_patches () in
+        !(state.dw_patches) () in
       let relevant ts = ts <> [Tag (None, 0, [])] in
-      custom_section ".debug_info" section_body dwarf_tags (relevant !dwarf_tags)
+      custom_section
+        ".debug_info" section_body state.dwarf_tags (relevant !(state.dwarf_tags))
 
     let debug_strings_section dss =
       let rec debug_strings_section_body = function
@@ -1138,13 +1280,14 @@ let encode (em : extended_module) =
 
 
     let debug_addr_section seqs =
+      let state = get_debug () in
       let debug_addr_section_body seqs =
         unit(fun start ->
             write16 0x0005; (* version *)
             u8 4; (* addr_size *)
             u8 0; (* segment_selector_size *)
             let write_addr (st, _, _) =
-              let rel addr = addr - !code_section_start in
+              let rel addr = addr - !(state.code_section_start) in
               write32 (rel st)
             in
             DW_Sequence.iter write_addr seqs;
@@ -1155,6 +1298,7 @@ let encode (em : extended_module) =
 
     (* 7.28 Range List Table *)
     let debug_rnglists_section sequence_bounds =
+      let state = get_debug () in
       let index = ref 0 in
       let debug_rnglists_section_body () =
         unit(fun start ->
@@ -1163,7 +1307,7 @@ let encode (em : extended_module) =
             u8 0; (* segment_selector_size *)
             write32 0; (* offset_entry_count *)
 
-            Promise.fulfill rangelists (pos s - start);
+            Promise.fulfill state.rangelists (pos s - start);
             DW_Sequence.iter (fun (st, _, en) ->
                 u8 Dwarf5.dw_RLE_startx_length;
                 uleb128 !index;
@@ -1173,7 +1317,10 @@ let encode (em : extended_module) =
             u8 Dwarf5.dw_RLE_end_of_list;
 
             (* extract the subprogram sizes to an array *)
-            Promise.fulfill subprogram_sizes (Array.of_seq (Seq.map (fun (st, _, en) -> en - st) (DW_Sequence.to_seq sequence_bounds)))
+            Promise.fulfill state.subprogram_sizes
+              (Array.of_seq
+                (Seq.map (fun (st, _, en) -> en - st)
+                  (DW_Sequence.to_seq sequence_bounds)))
         );
 
         in
@@ -1182,6 +1329,7 @@ let encode (em : extended_module) =
     (* Debug strings for line machine section, used by DWARF5: "6.2.4 The Line Number Program Header" *)
 
     let debug_line_str_section () =
+      let state = get_debug () in
       let debug_line_strings_section_body (dirs, sources) =
         let start = pos s in
         let rec strings = function
@@ -1192,11 +1340,15 @@ let encode (em : extended_module) =
             strings t in
         strings dirs;
         strings sources in
-      custom_section ".debug_line_str" debug_line_strings_section_body (!dir_names, List.map (fun ((n, _), p) -> n, p) !source_names) true
+      custom_section ".debug_line_str" debug_line_strings_section_body
+        (!(state.dir_names),
+         List.map (fun ((name, _), promise) -> name, promise) !(state.source_names))
+        true
 
     (* Debug line machine section, see DWARF5: "6.2 Line Number Information" *)
 
     let debug_line_section fs =
+      let state = get_debug () in
       let debug_line_section_body () =
 
         unit(fun start ->
@@ -1222,7 +1374,9 @@ let encode (em : extended_module) =
                 vec_format Dwarf5.[dw_LNCT_path, dw_FORM_line_strp];
 
                 (* directories_count, directories *)
-                vec_uleb128 write32 (rev_map (fun (_, (p, _)) -> Promise.value p) !dir_names);
+                vec_uleb128 write32
+                  (rev_map (fun (_, (promise, _)) -> Promise.value promise)
+                    !(state.dir_names));
 
                 (* file_name_entry_format_count, file_name_entry_formats *)
                 vec_format Dwarf5.[dw_LNCT_path, dw_FORM_line_strp; dw_LNCT_directory_index, dw_FORM_udata];
@@ -1233,11 +1387,14 @@ let encode (em : extended_module) =
                    will be placed at position 0 in the table *)
                 vec_uleb128
                   (fun (pos, indx) -> write32 pos; uleb128 indx)
-                  (map (fun (_, (p, dir_indx)) -> Promise.value p, dir_indx) !source_names);
+                  (map
+                    (fun (_, (promise, directory_index)) ->
+                      Promise.value promise, directory_index)
+                    !(state.source_names));
             );
 
             (* build the statement loc -> addr map *)
-            let statement_positions = !statement_positions in
+            let statement_positions = !(state.statement_positions) in
             let module StmtsAt = Map.Make (struct type t = pos let compare = compare end) in
             let statements_at = StmtsAt.of_seq (Seq.map (fun (k, v) -> v, k) (Instrs.to_seq statement_positions)) in
             let is_statement_at (addr, loc) =
@@ -1246,9 +1403,9 @@ let encode (em : extended_module) =
               | _ -> false in
 
             (* generate the line section *)
-            let code_start = !code_section_start in
+            let code_start = !(state.code_section_start) in
             let rel addr = addr - code_start in
-            let source_indices = !source_path_indices in
+            let source_indices = !(state.source_path_indices) in
 
             let mapping epi (addr, {file; line; column} as loc) : Dwarf5.Machine.state =
               let file' = List.(snd (hd source_indices) - assoc (if file = "" then "prim" else file) source_indices) in
@@ -1285,7 +1442,7 @@ let encode (em : extended_module) =
               let prg = List.fold_left (Fun.flip (@)) Dwarf5.[dw_LNS_advance_pc; 1; dw_LNE_end_sequence] prg0 in
               write_opcodes u8 uleb128 sleb128 write32 prg
             in
-            DW_Sequence.iter sequence !sequence_bounds
+            DW_Sequence.iter sequence !(state.sequence_bounds)
         )
       in
       custom_section ".debug_line" debug_line_section_body () (fs <> [])
@@ -1320,26 +1477,48 @@ let encode (em : extended_module) =
       wasm_features_section em.wasm_features;
       target_features_section em.target_features;
       source_mapping_url_section em.source_mapping_url;
-      if !Mo_config.Flags.debug_info then
-        begin
+      begin match debug with
+      | Some state ->
           debug_abbrev_section ();
-          debug_addr_section !sequence_bounds;
-          debug_rnglists_section !sequence_bounds;
+          debug_addr_section !(state.sequence_bounds);
+          debug_rnglists_section !(state.sequence_bounds);
           debug_line_str_section ();
           debug_line_section m.funcs;
           debug_info_section ();
-          debug_strings_section !dwarf_strings
-        end
+          debug_strings_section !(state.dwarf_strings)
+      | None -> ()
+      end
   end
   in E.module_ em;
 
-  let mappings = Buffer.contents map in
-  let n = max 0 ((String.length mappings) - 1) in
-  let json : Yojson.Basic.t = `Assoc [
-    ("version", `Int 3);
-    ("sources", `List ( List.map (fun x -> `String x) !sources ) );
-    ("sourcesContent", `List ( List.map (fun x -> if x = "" then `Null else `String x) !sourcesContent ) );
-    ("mappings", `String (String.sub mappings 0 n) )
-  ] in
+  let source_map_json =
+    match source_map with
+    | None -> None
+    | Some state ->
+      let mappings = Buffer.contents state.mappings in
+      let length = max 0 (String.length mappings - 1) in
+      let sources = List.rev state.sources_rev in
+      let sources_content = List.rev state.sources_content_rev in
+      let json : Yojson.Basic.t = `Assoc [
+        ("version", `Int 3);
+        ("sources", `List (List.map (fun source -> `String source) sources));
+        ("sourcesContent",
+          `List (List.map
+            (fun contents -> if contents = "" then `Null else `String contents)
+            sources_content));
+        ("mappings", `String (String.sub mappings 0 length))
+      ] in
+      For_testing.note_map_serialization ();
+      Some (Yojson.Basic.to_string json) in
 
-  (Yojson.Basic.to_string json, to_string s)
+  source_map_json, to_bytes s
+
+let encode_wasm_bytes em =
+  snd (encode_internal ~emit_source_map:false em)
+
+let encode_wasm em =
+  Bytes.to_string (encode_wasm_bytes em)
+
+let encode em =
+  let source_map, wasm = encode_internal ~emit_source_map:true em in
+  Option.get source_map, Bytes.to_string wasm

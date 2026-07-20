@@ -1,5 +1,13 @@
 (library
   (name linking)
+  (modules (:standard \ link_module_remapping_test))
   (libraries lib wasm_exts)
   (instrumentation (backend bisect_ppx --bisect-silent yes))
+)
+
+(test
+  (name link_module_remapping_test)
+  (modules link_module_remapping_test)
+  (modes byte)
+  (libraries lib wasm_exts linking)
 )

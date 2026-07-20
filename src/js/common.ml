@@ -37,7 +37,17 @@ let diagnostics_of_msg (msg : Diag.message) =
   end)
 
 let diagnostics_of_msgs (msgs : Diag.message list) =
-  Array.of_list (List.map diagnostics_of_msg msgs)
+  match msgs with
+  | [] -> [||]
+  | first :: rest ->
+    let diagnostics = Array.make (List.length msgs) (diagnostics_of_msg first) in
+    let rec fill index = function
+      | [] -> diagnostics
+      | msg :: remaining ->
+        diagnostics.(index) <- diagnostics_of_msg msg;
+        fill (index + 1) remaining
+    in
+    fill 1 rest
 
 let rec js_of_sexpr (sexpr : Wasm.Sexpr.sexpr) : Js.Unsafe.any =
   (* generate a JSON-serializable value tree from an s-expression *)
@@ -127,11 +137,13 @@ let js_compile_wasm mode source =
         | Some (_, txt) -> Js.some (Js.string txt)
         | _ -> Js.null in
       let candid = Idllib.Arrange_idl.string_of_prog idl_prog in
-      let (_, wasm) = CustomModuleEncode.encode m in
+      let wasm = CustomModuleEncode.encode_wasm_bytes m in
+      let borrowed = Js_of_ocaml.Typed_array.Bytes.to_uint8Array wasm in
       let constructor = Js.Unsafe.global##._Uint8Array in
-      let code = constructor##from
-        (object%js val length = String.length wasm end)
-        (Js.wrap_callback (fun _v k -> Char.code wasm.[k])) in
+      (* Typed_array.Bytes may alias the OCaml bytes. The constructor overload
+         taking another typed array performs one bulk copy into caller-owned
+         storage, so transferring it cannot detach compiler state. *)
+      let code = Js.Unsafe.new_obj constructor [|Js.Unsafe.inject borrowed|] in
       Js.some (object%js
         val wasm = code
         val candid = Js.string candid
@@ -196,6 +208,160 @@ let js_parse_motoko_with_deps enable_recovery path s =
           |> Array.of_list
           |> Js.array
       end))
+
+module Compact_inspect = struct
+  open Mo_def
+  open Syntax
+
+  type work =
+    | Exp of exp
+    | Dec of dec
+    | DecField of dec_field
+    | ExpField of exp_field
+    | Case of case
+
+  type result = {
+    imports : string list;
+    has_actor_url : bool;
+    dot_members : string list;
+  }
+
+  let prepend f xs rest =
+    List.rev_append (List.rev_map f xs) rest
+
+  let inspect (prog : prog) =
+    let imports = ref [] in
+    let has_actor_url = ref false in
+    let dot_members = ref [] in
+    let seen_dot_members = Hashtbl.create 16 in
+    let add_dot_member member =
+      if not (Hashtbl.mem seen_dot_members member) then begin
+        Hashtbl.add seen_dot_members member ();
+        dot_members := member :: !dot_members
+      end
+    in
+    let rec loop = function
+      | [] ->
+        {
+          imports = List.rev !imports;
+          has_actor_url = !has_actor_url;
+          dot_members = List.rev !dot_members;
+        }
+      | Exp e :: rest ->
+        begin match e.it with
+        | HoleE (_, inner) -> loop (Exp !inner :: rest)
+        | PrimE _ | VarE _ | LitE _ | ImplicitLibE _ -> loop rest
+        | ImportE (path, _) ->
+          imports := path :: !imports;
+          loop rest
+        | ActorUrlE inner ->
+          has_actor_url := true;
+          loop (Exp inner :: rest)
+        | UnE (_, _, inner)
+        | ShowE (_, inner)
+        | FromCandidE inner
+        | ProjE (inner, _)
+        | OptE inner
+        | DoOptE inner
+        | BangE inner
+        | TagE (_, inner)
+        | NotE inner
+        | AssertE (_, inner)
+        | LabelE (_, _, inner)
+        | BreakE (_, _, inner)
+        | RetE inner
+        | AwaitE (_, inner)
+        | ThrowE inner
+        | AnnotE (inner, _)
+        | DebugE inner
+        | IgnoreE inner ->
+          loop (Exp inner :: rest)
+        | DotE (inner, member, _) ->
+          add_dot_member member.it;
+          loop (Exp inner :: rest)
+        | BinE (_, left, _, right)
+        | RelE (_, left, _, right)
+        | IdxE (left, right)
+        | AssignE (left, right)
+        | AndE (left, right)
+        | OrE (left, right)
+        | NullCoalesceE (left, right)
+        | WhileE (left, right, _) ->
+          loop (Exp left :: Exp right :: rest)
+        | ToCandidE es | TupE es | ArrayE (_, es) ->
+          loop (prepend (fun child -> Exp child) es rest)
+        | ObjBlockE (_, _, _, fields) ->
+          (* js_parse_motoko deliberately omits the parenthetical expression. *)
+          loop (prepend (fun field -> DecField field) fields rest)
+        | ObjE (bases, fields) ->
+          let rest = prepend (fun field -> ExpField field) fields rest in
+          loop (prepend (fun base -> Exp base) bases rest)
+        | FuncE (_, _, _, _, _, _, body) ->
+          loop (Exp body :: rest)
+        | CallE (_, callee, _, (_, argument)) ->
+          (* Match the full-AST API's include_parenthetical = false behavior. *)
+          loop (Exp callee :: Exp !argument :: rest)
+        | BlockE declarations ->
+          loop (prepend (fun declaration -> Dec declaration) declarations rest)
+        | IfE (condition, yes, no) ->
+          loop (Exp condition :: Exp yes :: Exp no :: rest)
+        | SwitchE (scrutinee, cases) ->
+          loop (Exp scrutinee :: prepend (fun case -> Case case) cases rest)
+        | LoopE (body, None, _) ->
+          loop (Exp body :: rest)
+        | LoopE (body, Some condition, _) ->
+          loop (Exp body :: Exp condition :: rest)
+        | ForE (_, iterator, body, _) ->
+          loop (Exp iterator :: Exp body :: rest)
+        | AsyncE (_, _, _, body) ->
+          loop (Exp body :: rest)
+        | TryE (body, cases, finally) ->
+          let rest = match finally with None -> rest | Some e -> Exp e :: rest in
+          loop (Exp body :: prepend (fun case -> Case case) cases rest)
+        end
+      | Dec declaration :: rest ->
+        begin match declaration.it with
+        | ExpD e | VarD (_, e) -> loop (Exp e :: rest)
+        | LetD (_, e, None) -> loop (Exp e :: rest)
+        | LetD (_, e, Some fail) -> loop (Exp e :: Exp fail :: rest)
+        | TypD _ -> loop rest
+        | ClassD (_, _, _, _, _, _, _, _, fields)
+        | MixinD (_, _, fields) ->
+          (* Class parenthetical expressions are omitted by js_parse_motoko. *)
+          loop (prepend (fun field -> DecField field) fields rest)
+        | IncludeD (_, _, e, _) -> loop (Exp e :: rest)
+        end
+      | DecField field :: rest -> loop (Dec field.it.dec :: rest)
+      | ExpField field :: rest -> loop (Exp field.it.exp :: rest)
+      | Case case :: rest -> loop (Exp case.it.exp :: rest)
+    in
+    loop (prepend (fun declaration -> Dec declaration) prog.it [])
+end
+
+let js_inspect_motoko path s =
+  let path = Js.to_string path in
+  let parse_result = Pipeline.parse_string path (Js.to_string s) in
+  js_result parse_result (fun (prog, _) ->
+    let inspection = Compact_inspect.inspect prog in
+    let open Compact_inspect in
+    let strings xs =
+      match xs with
+      | [] -> Js.array [||]
+      | first :: rest ->
+        let values = Array.make (List.length xs) (Js.string first) in
+        let rec fill index = function
+          | [] -> Js.array values
+          | value :: remaining ->
+            values.(index) <- Js.string value;
+            fill (index + 1) remaining
+        in
+        fill 1 rest
+    in
+    Js.some (object%js
+      val immediateImports = strings inspection.imports
+      val hasActorUrl = Js.bool inspection.has_actor_url
+      val dotMembers = strings inspection.dot_members
+    end))
 
 module Map_conversion (Map : Map.S) = struct
   let from_js

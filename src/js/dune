@@ -21,6 +21,14 @@
 )
 
 (executable
+ (name moc_wasm)
+ (modes wasm)
+ (modules moc_wasm)
+ (libraries common mo_config idllib)
+ (preprocess (pps js_of_ocaml-ppx))
+)
+
+(executable
  (name moc_interpreter)
  (modes js)
  (modules moc_interpreter)

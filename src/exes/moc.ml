@@ -316,14 +316,21 @@ let process_files files : unit =
         else None
     } in
 
+    let source_map, wasm =
+      if !gen_source_map then
+        let source_map, wasm = CustomModuleEncode.encode module_ in
+        Some source_map, wasm
+      else
+        None, CustomModuleEncode.encode_wasm module_ in
     let oc = open_out !out_file in
-    let (source_map, wasm) = CustomModuleEncode.encode module_ in
     output_string oc wasm; close_out oc;
 
-    if !gen_source_map then begin
+    begin match source_map with
+    | Some source_map ->
       let oc_ = open_out source_map_file in
       output_string oc_ source_map; close_out oc_
-      end;
+    | None -> ()
+    end;
 
     if !idl then begin
       let open Idllib in

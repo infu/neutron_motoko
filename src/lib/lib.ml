@@ -669,19 +669,21 @@ struct
     let ic = Stdlib.open_in path in
     let dir, base = Filename.(dirname path, basename path) in
     (* TODO: we could check dir too, but it's hairier *)
-    let files = Sys.readdir dir in
-    if not (Array.exists (fun name -> name = base) files) then
-      begin
+    let warnings =
+      try
+        let files = Sys.readdir dir in
+        if Array.exists (fun name -> name = base) files then [] else
         let open Stdlib.String in
         let lbase = lowercase_ascii base in
         if Array.exists (fun name -> lowercase_ascii name = lbase) files then
-          let message = Printf.sprintf "file %s has been located with a name of different case" base in
-          ic, [message]
+          [Printf.sprintf "file %s has been located with a name of different case" base]
         else
-          let message = Printf.sprintf "file %s has been located with a different name" base in
-          ic, [message]
-      end
-    else ic, []
+          (* A successful exact open is authoritative. Some virtual filesystem
+             adapters cannot enumerate a directory completely (or at all). *)
+          []
+      with _ -> []
+    in
+    ic, warnings
 
     let contents file = In_channel.with_open_bin file In_channel.input_all
 end

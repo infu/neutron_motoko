@@ -69,6 +69,5 @@ let () =
       Printf.eprintf "%s\n" e;
       exit 1
   in
-  let (_map, wasm) = CustomModuleEncode.encode linked in
+  let wasm = CustomModuleEncode.encode_wasm linked in
   write_file !out_file wasm
-
