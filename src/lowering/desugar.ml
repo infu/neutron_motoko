@@ -758,7 +758,7 @@ and build_actor at chain ts (exp_opt : Ir.exp option) self_id es obj_typ0 =
   let ds = decs (List.map (fun ef -> ef.it.S.dec) es) in
   let pairs = List.map2 stabilize stabs ds in
   let idss = List.map fst pairs in
-  let ids = List.concat idss in
+  let ids = Lib.List.concat idss in
   let triples = List.map view stabs in
   let view_ds = List.concat_map (fun (ds, _, _) -> ds) triples in
   (* let view_fields = List.concat_map (fun (_, flds, _) -> flds) triples in *)
@@ -1161,7 +1161,7 @@ and obj obj_typ efs bases =
   let dss, fs = map (exp_field obj_typ) efs |> split in
   let ds', fs' = concat_map gap (T.as_obj obj_typ |> snd) |> split in
   let obj_e = newObjE T.Object (append fs fs') obj_typ in
-  let decs = append base_decs (append (flatten dss) ds') in
+  let decs = append base_decs (append (Lib.List.flatten dss) ds') in
   (blockE decs obj_e).it
 
 and typ_binds tbs = List.map typ_bind tbs

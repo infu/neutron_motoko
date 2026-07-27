@@ -339,7 +339,7 @@ let package_imports base packages =
         ) files::acc)
     packages []
   in
-  List.concat imports
+  Lib.List.concat imports
 
 let enhanced_migration_imports flags : resolved_import list Diag.result =
   match flags.enhanced_migration with

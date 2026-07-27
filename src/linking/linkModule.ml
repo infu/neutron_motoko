@@ -306,7 +306,7 @@ let remove_non_ic_exports (em : extended_module) : extended_module =
 type renumbering = int32 -> int32
 
 let resolve imports exports : (int32 * int32) list =
-  List.flatten (List.map (fun (fi, name) ->
+  Lib.List.flatten (List.map (fun (fi, name) ->
     match NameMap.find_opt name exports with
     | Some fi' -> [ (fi, fi') ]
     | None -> []
@@ -968,7 +968,9 @@ let patch_got_mem_accesses got_mem_imports memory_base = fun m ->
     | If (ty, is1, is2) -> [If (ty, instrs is1, instrs is2)]
     | i -> [i]
   and instr (i: instr) : instr list = phrase_one_to_many instr' i
-  and instrs (is : instr list) : instr list = List.flatten (List.map instr is) in
+  and instrs (is : instr list) : instr list =
+    Lib.List.flatten (List.map instr is)
+  in
 
   let func' f = { f with body = instrs f.body } in
   let func = phrase func' in
@@ -1265,7 +1267,9 @@ let link (em1 : extended_module) libname (em2 : extended_module) =
           memory_init 
         ]
       in
-      let load_passive_segments = List.concat (List.mapi load_passive_segment data_segments) in
+      let load_passive_segments =
+        Lib.List.concat (List.mapi load_passive_segment data_segments)
+      in
   
       let inject_in_func' code f = { f with body = code @ f.body } in
       let inject_in_func code = phrase (inject_in_func' code) in

@@ -653,7 +653,9 @@ let code _ s =
   let ns = List.map (fun (n, _) -> I64_convert.extend_i32_u n) nts in
   require (I64.lt_u (List.fold_left I64.add 0L ns) 0x1_0000_0000L)
     s pos "too many locals";
-  let locals = List.flatten (List.map (Lib.Fun.uncurry Lib.List32.make) nts) in
+  let locals =
+    Lib.List.flatten (List.map (Lib.Fun.uncurry Lib.List32.make) nts)
+  in
   let body = instr_block s in
   end_ s;
   {locals; body; ftype = Source.((-1l) @@ Source.no_region)}

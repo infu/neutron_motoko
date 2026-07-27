@@ -27,6 +27,10 @@ type ('a, 'b) these =
 
 module List :
 sig
+  (** Stack-safe equivalents of the standard list concatenation functions. *)
+  val flatten : 'a list list -> 'a list
+  val concat : 'a list list -> 'a list
+
   val make : int -> 'a -> 'a list
   val table : int -> (int -> 'a) -> 'a list
   val group : ('a -> 'a -> bool) -> 'a list -> 'a list list

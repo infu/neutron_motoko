@@ -4874,7 +4874,7 @@ and check_stab env sort scope dec_fields =
       []
     | _ -> []) dec_fields
   in
-  let ids = List.concat idss in
+  let ids = Lib.List.concat idss in
   check_ids env "actor type" "stable variable" ids;
   check_stable_defaults env sort dec_fields;
   List.sort T.compare_field

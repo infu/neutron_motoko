@@ -320,6 +320,9 @@ type ('a, 'b) these =
 
 module List =
 struct
+  let flatten lists = StdList.concat_map (fun list -> list) lists
+  let concat = flatten
+
   let rec make n x = make' n x []
   and make' n x xs =
     if n = 0 then xs else make' (n - 1) x (x::xs)
@@ -697,6 +700,15 @@ struct
    Maybe we should break up lib into its components, now that
    it is a dune library.
 *)
+  let%test "List.flatten preserves order" =
+    List.flatten [[]; [1; 2]; []; [3; 4]] = [1; 2; 3; 4]
+
+  let%test "List.flatten is stack-safe for many lists" =
+    let flattened = List.flatten (List.table 100_000 (fun index -> [index])) in
+    Stdlib.List.length flattened = 100_000 &&
+    Stdlib.List.hd flattened = 0 &&
+    List.last flattened = 99_999
+
   let%test "bytes_of_hex DEADBEEF" =
     Hex.bytes_of_hex "DEADBEEF" = "\xDE\xAD\xBE\xEF"
   let%test "bytes_of_hex 0000" =
