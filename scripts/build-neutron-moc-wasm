@@ -14,7 +14,14 @@ rm -rf "$out_dir"
 mkdir -p "$out_dir"
 
 install -m 0644 "$nix_out/bin/moc.wasm.js" "$out_dir/moc.wasm.js"
-install -m 0644 "$nix_out/bin/moc.wasm.js" "$out_dir/moc.wasm.cjs"
+# wasm_of_ocaml starts its loader as an otherwise-discarded async expression.
+# Retain that promise so Workers can await initialization and report the real
+# fetch, instantiation, or startup failure instead of polling for an export.
+perl -0pi -e '
+  $count = s/;\(([A-Za-z_\x24][A-Za-z0-9_\x24]*)=>async /;globalThis.NeutronMotokoReady=($1=>async /;
+  die "could not expose wasm_of_ocaml initialization promise\n" unless $count == 1;
+' "$out_dir/moc.wasm.js"
+install -m 0644 "$out_dir/moc.wasm.js" "$out_dir/moc.wasm.cjs"
 # The generated Node path follows require.main. Neutron loads the compiler from
 # a service entrypoint one directory above, so retain the vendored loader's
 # established sidecar lookup relative to the CJS file itself.
