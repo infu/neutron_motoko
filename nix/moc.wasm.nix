@@ -71,7 +71,19 @@ pkgs.stdenv.mkDerivation {
 
       const result = compiler.compileWasm("ic", "main.mo");
       if (!result || !result.code || !result.code.wasm || !result.code.candid) {
-        console.error(JSON.stringify(result));
+        console.error(JSON.stringify({
+          hasResult: Boolean(result),
+          hasCode: Boolean(result && result.code),
+          wasmBytes: result && result.code && result.code.wasm
+            ? result.code.wasm.byteLength
+            : null,
+          candidBytes: result && result.code && typeof result.code.candid === "string"
+            ? result.code.candid.length
+            : null,
+          diagnostics: result && Array.isArray(result.diagnostics)
+            ? result.diagnostics.length
+            : null,
+        }));
         throw new Error("Motoko Wasm compiler smoke compile failed");
       }
 

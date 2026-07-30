@@ -306,11 +306,11 @@ let remove_non_ic_exports (em : extended_module) : extended_module =
 type renumbering = int32 -> int32
 
 let resolve imports exports : (int32 * int32) list =
-  Lib.List.flatten (List.map (fun (fi, name) ->
+  List.filter_map (fun (fi, name) ->
     match NameMap.find_opt name exports with
-    | Some fi' -> [ (fi, fi') ]
-    | None -> []
-    ) imports)
+    | Some fi' -> Some (fi, fi')
+    | None -> None
+    ) imports
 
 let calculate_renaming n_imports1 n_things1 n_imports2 resolved12 resolved21 : (renumbering * renumbering) =
   let open Int32 in
@@ -360,12 +360,9 @@ let identity_index_remapping = {
   global_index = identity_index;
 }
 
-let map_tail f xs =
-  let rec go acc = function
-    | [] -> List.rev acc
-    | x :: xs -> go (f x :: acc) xs
-  in
-  go [] xs
+(* OCaml 5.4 lowers [List.map] with tail-mod-cons. It is stack-safe and builds
+   the result directly, unlike an accumulator followed by [List.rev]. *)
+let map_tail = List.map
 
 (* The continuation is kept on the heap so remapping does not consume one
    OCaml/Wasm call frame for every nested block. The current list and its
@@ -386,25 +383,33 @@ type instruction_continuation =
 let remap_var rn v = phrase rn v
 
 let remap_block_type remapping = function
-  | VarBlockType type_index ->
+  | VarBlockType type_index when remapping.type_index != identity_index ->
     VarBlockType (remap_var remapping.type_index type_index)
   | ValBlockType _ as block_type -> block_type
+  | VarBlockType _ as block_type -> block_type
 
 let remap_instructions remapping instructions =
+  let remap_types = remapping.type_index != identity_index in
+  let remap_functions = remapping.function_index != identity_index in
+  let remap_globals = remapping.global_index != identity_index in
   let remap_shallow instruction =
-    let it = match instruction.it with
-      | Call function_index ->
-        Call (remap_var remapping.function_index function_index)
-      | CallIndirect (table_index, type_index) ->
-        CallIndirect (table_index, remap_var remapping.type_index type_index)
-      | GlobalGet global_index ->
-        GlobalGet (remap_var remapping.global_index global_index)
-      | GlobalSet global_index ->
-        GlobalSet (remap_var remapping.global_index global_index)
+    match instruction.it with
+      | Call function_index when remap_functions ->
+        { instruction with
+          it = Call (remap_var remapping.function_index function_index) }
+      | CallIndirect (table_index, type_index) when remap_types ->
+        { instruction with
+          it =
+            CallIndirect
+              (table_index, remap_var remapping.type_index type_index) }
+      | GlobalGet global_index when remap_globals ->
+        { instruction with
+          it = GlobalGet (remap_var remapping.global_index global_index) }
+      | GlobalSet global_index when remap_globals ->
+        { instruction with
+          it = GlobalSet (remap_var remapping.global_index global_index) }
       | Block _ | Loop _ | If _ -> assert false
-      | other -> other
-    in
-    { instruction with it }
+      | _ -> instruction
   in
   let rec go remaining reversed continuation =
     match remaining with
@@ -469,6 +474,9 @@ let remap_instructions remapping instructions =
    constant expressions; table, memory, local, label, and data indices remain
    untouched. *)
 let remap_module_indices remapping (m : module_') : module_' =
+  let remap_types = remapping.type_index != identity_index in
+  let remap_functions = remapping.function_index != identity_index in
+  let remap_globals = remapping.global_index != identity_index in
   let global_only =
     { identity_index_remapping with global_index = remapping.global_index }
   in
@@ -478,6 +486,7 @@ let remap_module_indices remapping (m : module_') : module_' =
   (* The former record update evaluated imports before functions. This matters
      because the type renamer assigns indices in first-seen order. *)
   let imports =
+    if not remap_types then m.imports else
     map_tail (fun import ->
       let idesc = match import.it.idesc.it with
         | FuncImport type_index ->
@@ -492,26 +501,38 @@ let remap_module_indices remapping (m : module_') : module_' =
     map_tail (fun func ->
       (* The former function record update evaluated the body before ftype. *)
       let body = remap_instructions remapping func.it.body in
-      let ftype = remap_var remapping.type_index func.it.ftype in
+      let ftype =
+        if remap_types
+        then remap_var remapping.type_index func.it.ftype
+        else func.it.ftype
+      in
       { func with it = { func.it with ftype; body } }
     ) m.funcs
   in
   let globals =
+    if not remap_globals then m.globals else
     map_tail (fun global ->
       { global with
         it = { global.it with value = remap_const global.it.value } }
     ) m.globals
   in
   let elems =
+    if not remap_globals && not remap_functions then m.elems else
     map_tail (fun (elem : table_segment) ->
       { elem with it = {
           elem.it with
-          offset = remap_const elem.it.offset;
-          init = map_tail (remap_var remapping.function_index) elem.it.init;
+          offset =
+            if remap_globals then remap_const elem.it.offset
+            else elem.it.offset;
+          init =
+            if remap_functions
+            then map_tail (remap_var remapping.function_index) elem.it.init
+            else elem.it.init;
         } }
     ) m.elems
   in
   let datas =
+    if not remap_globals then m.datas else
     map_tail (fun data ->
       let dmode = match data.it.dmode.it with
         | Active { index; offset } ->
@@ -522,13 +543,14 @@ let remap_module_indices remapping (m : module_') : module_' =
     ) m.datas
   in
   let exports =
+    if not remap_functions && not remap_globals then m.exports else
     map_tail (fun export ->
       let edesc = match export.it.edesc.it with
-        | FuncExport function_index ->
+        | FuncExport function_index when remap_functions ->
           { export.it.edesc with
             it = FuncExport
               (remap_var remapping.function_index function_index) }
-        | GlobalExport global_index ->
+        | GlobalExport global_index when remap_globals ->
           { export.it.edesc with
             it = GlobalExport (remap_var remapping.global_index global_index) }
         | _ -> export.it.edesc
@@ -543,7 +565,10 @@ let remap_module_indices remapping (m : module_') : module_' =
     elems;
     datas;
     exports;
-    start = Option.map (remap_var remapping.function_index) m.start;
+    start =
+      if remap_functions
+      then Option.map (remap_var remapping.function_index) m.start
+      else m.start;
   }
 
 let rename_globals rn =
@@ -938,6 +963,7 @@ let collect_got_imports (m : module_') : got_import list =
    This is done by adding the library memory base (`lib_heap_start`) to the offset
    that is stored in the exported global that corresponds to the GOT.mem import. *)
 let patch_got_mem_accesses got_mem_imports memory_base = fun m ->
+  if got_mem_imports = [] then m else
   let phrase_one_to_many f x = List.map (fun y -> { x with it = y }) (f x.it) in
 
   let find_got_mem global_index =
@@ -969,7 +995,7 @@ let patch_got_mem_accesses got_mem_imports memory_base = fun m ->
     | i -> [i]
   and instr (i: instr) : instr list = phrase_one_to_many instr' i
   and instrs (is : instr list) : instr list =
-    Lib.List.flatten (List.map instr is)
+    List.concat_map instr is
   in
 
   let func' f = { f with body = instrs f.body } in

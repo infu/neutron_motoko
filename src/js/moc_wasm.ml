@@ -32,19 +32,36 @@ let () =
       method setBlobImportPlaceholders placeholders = Flags.blob_import_placeholders := placeholders
       method gcFlags option = gc_flags option
       method run list s = Flags.compiled := false; wrap_output (fun _ -> js_run list s)
-      method check s = Flags.compiled := false; js_check s
-      method checkWithScopeCache s scopeCache = Flags.compiled := false; js_check_with_scope_cache s scopeCache
-      method candid s = Flags.compiled := true; js_candid s
-      method stableCompatible pre post = js_stable_compatible pre post
-      method compileWasm mode s = Flags.compiled := true; js_compile_wasm mode s
-      method parseCandid s = js_parse_candid s
-      method parseMotoko enableRecovery s = js_parse_motoko enableRecovery s
-      method parseMotokoWithDeps enableRecovery path s = js_parse_motoko_with_deps enableRecovery path s
-      method inspectMotoko path s = js_inspect_motoko path s
-      method parseMotokoTyped paths = js_parse_motoko_typed paths
+      method check s =
+        Flags.compiled := false;
+        discard_output (fun () -> js_check s)
+      method checkWithScopeCache s scopeCache =
+        Flags.compiled := false;
+        discard_output (fun () -> js_check_with_scope_cache s scopeCache)
+      method candid s =
+        Flags.compiled := true;
+        discard_output (fun () -> js_candid s)
+      method stableCompatible pre post =
+        discard_output (fun () -> js_stable_compatible pre post)
+      method compileWasm mode s =
+        Flags.compiled := true;
+        discard_output (fun () -> js_compile_wasm mode s)
+      method parseCandid s =
+        discard_output (fun () -> js_parse_candid s)
+      method parseMotoko enableRecovery s =
+        discard_output (fun () -> js_parse_motoko enableRecovery s)
+      method parseMotokoWithDeps enableRecovery path s =
+        discard_output (fun () -> js_parse_motoko_with_deps enableRecovery path s)
+      method inspectMotoko path s =
+        discard_output (fun () -> js_inspect_motoko path s)
+      method parseMotokoTyped paths =
+        discard_output (fun () -> js_parse_motoko_typed paths)
       method parseMotokoTypedWithScopeCache enableRecovery paths scopeCache =
-        js_parse_motoko_typed_with_scope_cache enableRecovery paths scopeCache
-      method contextualDotSuggestions scope rawExp = js_contextual_dot_suggestions scope rawExp
-      method contextualDotModule rawExp = js_contextual_dot_module rawExp
+        discard_output (fun () ->
+          js_parse_motoko_typed_with_scope_cache enableRecovery paths scopeCache)
+      method contextualDotSuggestions scope rawExp =
+        discard_output (fun () -> js_contextual_dot_suggestions scope rawExp)
+      method contextualDotModule rawExp =
+        discard_output (fun () -> js_contextual_dot_module rawExp)
       method printDeps file = print_deps file
      end)

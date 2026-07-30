@@ -208,10 +208,10 @@ type t =
   | RememberDepth of depth * t
   | BranchTo of depth
 
-(* Completion frames keep nested wasm bodies off the OCaml call stack too.
-   Each saved instruction list is in reverse emission order. *)
+(* Continuation frames keep append trees and nested wasm bodies off the OCaml
+   call stack. Each saved instruction list is in reverse emission order. *)
 type materialize_frame =
-  | Emit of int32 * Source.region * t
+  | ContinueWith of int32 * Source.region * t
   | FinishBlock of instr list * Source.region * block_type
   | FinishLoop of instr list * Source.region
   | FinishThen of instr list * int32 * Source.region * block_type * t
@@ -224,52 +224,55 @@ let optimized_reversed is =
    Nested wasm bodies are still optimized, matching the old combinators: they
    called [to_nested_list] before returning their enclosing instruction. *)
 let materialize_raw_at depth pos (is : t) : instr list =
-  let rec run emitted = function
-    | [] -> List.rev emitted
-    | Emit (_, _, Empty) :: work ->
-      run emitted work
-    | Emit (d, at, Leaf instr) :: work ->
-      run ((instr @@ at) :: emitted) work
-    | Emit (d, at, Append (left, right)) :: work ->
-      run emitted (Emit (d, at, left) :: Emit (d, at, right) :: work)
-    | Emit (d, _, WithRegion (at, body)) :: work ->
-      run emitted (Emit (d, at, body) :: work)
-    | Emit (d, at, BlockNode (ty, body)) :: work ->
-      run []
-        (Emit (Int32.add d 1l, at, body) ::
-         FinishBlock (emitted, at, ty) :: work)
+  let rec emit emitted d at current work =
+    match current with
+    | Empty ->
+      resume emitted work
+    | Leaf instr ->
+      resume ((instr @@ at) :: emitted) work
+    | Append (left, right) ->
+      (* Descend into the current child directly. Only the deferred right
+         sibling needs a heap continuation. *)
+      emit emitted d at left (ContinueWith (d, at, right) :: work)
+    | WithRegion (at, body) ->
+      emit emitted d at body work
+    | BlockNode (ty, body) ->
+      emit [] (Int32.add d 1l) at body
+        (FinishBlock (emitted, at, ty) :: work)
+    | LoopNode body ->
+      emit [] (Int32.add d 1l) at body
+        (FinishLoop (emitted, at) :: work)
+    | IfNode (ty, thn, els) ->
+      emit [] (Int32.add d 1l) at thn
+        (FinishThen (emitted, d, at, ty, els) :: work)
+    | RememberDepth (label, body) ->
+      (* This must happen before [body] is visited: it may start with a
+         [BranchTo] that reads the promise. *)
+      Lib.Promise.fulfill label d;
+      emit emitted d at body work
+    | BranchTo label ->
+      let relative_depth = Int32.sub d (Lib.Promise.value label) in
+      resume ((Br (relative_depth @@ at) @@ at) :: emitted) work
+  and resume emitted = function
+    | [] ->
+      List.rev emitted
+    | ContinueWith (d, at, body) :: work ->
+      emit emitted d at body work
     | FinishBlock (parent, at, ty) :: work ->
       let body = optimized_reversed emitted in
-      run ((Block (ty, body) @@ at) :: parent) work
-    | Emit (d, at, LoopNode body) :: work ->
-      run []
-        (Emit (Int32.add d 1l, at, body) ::
-         FinishLoop (emitted, at) :: work)
+      resume ((Block (ty, body) @@ at) :: parent) work
     | FinishLoop (parent, at) :: work ->
       let body = optimized_reversed emitted in
-      run ((Loop (ValBlockType None, body) @@ at) :: parent) work
-    | Emit (d, at, IfNode (ty, thn, els)) :: work ->
-      run []
-        (Emit (Int32.add d 1l, at, thn) ::
-         FinishThen (emitted, d, at, ty, els) :: work)
+      resume ((Loop (ValBlockType None, body) @@ at) :: parent) work
     | FinishThen (parent, d, at, ty, els) :: work ->
       let thn = optimized_reversed emitted in
-      run []
-        (Emit (Int32.add d 1l, at, els) ::
-         FinishIf (parent, at, ty, thn) :: work)
+      emit [] (Int32.add d 1l) at els
+        (FinishIf (parent, at, ty, thn) :: work)
     | FinishIf (parent, at, ty, thn) :: work ->
       let els = optimized_reversed emitted in
-      run ((If (ty, thn, els) @@ at) :: parent) work
-    | Emit (d, at, RememberDepth (label, body)) :: work ->
-      (* This must happen before [body] is put at the head of the work list:
-         it may start with a [BranchTo] that reads the promise. *)
-      Lib.Promise.fulfill label d;
-      run emitted (Emit (d, at, body) :: work)
-    | Emit (d, at, BranchTo label) :: work ->
-      let relative_depth = Int32.sub d (Lib.Promise.value label) in
-      run ((Br (relative_depth @@ at) @@ at) :: emitted) work
+      resume ((If (ty, thn, els) @@ at) :: parent) work
   in
-  run [] [Emit (depth, pos, is)]
+  emit [] depth pos is []
 
 let materialize_raw is =
   materialize_raw_at 0l Wasm.Source.no_region is
@@ -337,7 +340,9 @@ let table n f =
 (* Region-managing combinator *)
 
 let with_region (pos : Source.region) (body : t) : t =
-  WithRegion (pos, body)
+  match body with
+  | Empty -> Empty
+  | _ -> WithRegion (pos, body)
 
 (* Depths-managing combinators *)
 
@@ -382,15 +387,21 @@ let labeled_block1 ty depth (body : t) : t =
 (* Obtain the setter from a known variable's getter *)
 
 let setter_for (getter : t) =
-  match materialize_raw getter with
-  | [{it = LocalGet v; _}] -> i (LocalSet v)
-  | [{it = GlobalGet v; _}] -> i (GlobalSet v)
-  | _ -> failwith "input must be a getter"
+  match getter with
+  | Leaf (LocalGet v) -> i (LocalSet v)
+  | Leaf (GlobalGet v) -> i (GlobalSet v)
+  | _ ->
+    match materialize_raw getter with
+    | [{it = LocalGet v; _}] -> i (LocalSet v)
+    | [{it = GlobalGet v; _}] -> i (GlobalSet v)
+    | _ -> failwith "input must be a getter"
 
 (* Intended to be used within assert *)
 
 let is_nop (is : t) =
-  materialize_raw is = []
+  match is with
+  | Empty -> true
+  | _ -> materialize_raw is = []
 
 (* DWARF tags and attributes: see Note [funneling DIEs through Wasm.Ast] *)
 

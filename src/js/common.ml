@@ -528,23 +528,31 @@ let js_read_dir path = Sys.readdir (Js.to_string path) |> Array.map Js.string |>
 let stdout_buffer = Buffer.create(1000)
 let stderr_buffer = Buffer.create(1000)
 
-let wrap_output f =
-  let result = f () in
-  let stdout_result = Buffer.contents stdout_buffer in
-  let stderr_result = Buffer.contents stderr_buffer in
+let clear_output_buffers () =
   Buffer.clear stdout_buffer;
-  Buffer.clear stderr_buffer;
-  object%js
-    val stdout = Js.bytestring stdout_result
-    val stderr = Js.bytestring stderr_result
-    val result = result
-  end
+  Buffer.clear stderr_buffer
+
+let discard_output f =
+  clear_output_buffers ();
+  Fun.protect ~finally:clear_output_buffers f
+
+let wrap_output f =
+  clear_output_buffers ();
+  Fun.protect ~finally:clear_output_buffers (fun () ->
+    let result = f () in
+    let stdout_result = Buffer.contents stdout_buffer in
+    let stderr_result = Buffer.contents stderr_buffer in
+    object%js
+      val stdout = Js.bytestring stdout_result
+      val stderr = Js.bytestring stderr_result
+      val result = result
+    end)
 
 let print_deps file =
-  let _ = Pipeline.print_deps (Js.to_string file) in
-  let stdout_result = Buffer.contents stdout_buffer in
-  Buffer.clear stdout_buffer;
-  Js.bytestring stdout_result
+  clear_output_buffers ();
+  Fun.protect ~finally:clear_output_buffers (fun () ->
+    let _ = Pipeline.print_deps (Js.to_string file) in
+    Js.bytestring (Buffer.contents stdout_buffer))
 
 let add_package package dir =
   let libs = Flags.package_urls in

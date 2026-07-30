@@ -654,7 +654,7 @@ let code _ s =
   require (I64.lt_u (List.fold_left I64.add 0L ns) 0x1_0000_0000L)
     s pos "too many locals";
   let locals =
-    Lib.List.flatten (List.map (Lib.Fun.uncurry Lib.List32.make) nts)
+    List.concat_map (Lib.Fun.uncurry Lib.List32.make) nts
   in
   let body = instr_block s in
   end_ s;

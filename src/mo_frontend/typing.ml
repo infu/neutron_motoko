@@ -4840,7 +4840,7 @@ and check_stab env sort scope dec_fields =
           "variable %s is declared stable but has non-stable type%a" id
           display_typ t1;
   in
-  let idss = List.map (fun df ->
+  let ids = List.concat_map (fun df ->
     match sort.it, df.it.stab, df.it.dec.it with
     | (T.Object | T.Module), None, _ -> []
     | (T.Object | T.Module), Some stab, _ ->
@@ -4874,7 +4874,6 @@ and check_stab env sort scope dec_fields =
       []
     | _ -> []) dec_fields
   in
-  let ids = Lib.List.concat idss in
   check_ids env "actor type" "stable variable" ids;
   check_stable_defaults env sort dec_fields;
   List.sort T.compare_field

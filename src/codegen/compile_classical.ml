@@ -10289,9 +10289,6 @@ module AllocHow = struct
   type how = Const | LocalImmut of SR.t | LocalMut of SR.t | StoreHeap | StoreStatic
   type allocHow = how M.t
 
-  let disjoint_union : allocHow -> allocHow -> allocHow =
-    M.union (fun v _ _ -> fatal "AllocHow.disjoint_union: %s" v)
-
   let join : allocHow -> allocHow -> allocHow =
     M.union (fun _ x y -> Some (match x, y with
       | StoreStatic, StoreHeap | StoreHeap, StoreStatic
@@ -10306,17 +10303,7 @@ module AllocHow = struct
     ))
   let joins = List.fold_left join M.empty
 
-  let map_of_set = Freevars.map_of_set
   let set_of_map = Freevars.set_of_map
-
-  (* Various filters used in the set operations below *)
-  let is_local_mut _ = function
-    | LocalMut _ -> true
-    | _ -> false
-
-  let is_local _ = function
-    | LocalImmut _ | LocalMut _ -> true
-    | _ -> false
 
   let how_captured lvl how seen captured =
     (* What to do so that we can capture something?
@@ -10328,13 +10315,21 @@ module AllocHow = struct
     *)
     match lvl with
     | VarEnv.NotTopLvl ->
-      map_of_set StoreHeap (S.union
-        (S.inter (set_of_map (M.filter is_local_mut how)) captured)
-        (S.inter (set_of_map (M.filter is_local how)) (S.diff captured seen))
-      )
+      S.fold (fun name result ->
+        match M.find_opt name how with
+        | Some (LocalMut _) ->
+          M.add name StoreHeap result
+        | Some (LocalImmut _) when not (S.mem name seen) ->
+          M.add name StoreHeap result
+        | _ -> result
+      ) captured M.empty
     | VarEnv.TopLvl ->
-      map_of_set StoreStatic
-        (S.inter (set_of_map (M.filter is_local how)) captured)
+      S.fold (fun name result ->
+        match M.find_opt name how with
+        | Some (LocalImmut _ | LocalMut _) ->
+          M.add name StoreStatic result
+        | _ -> result
+      ) captured M.empty
 
   (* A bit like StackRep.of_type, but only for those types and stackreps that
      we support in local variables *)
@@ -10348,9 +10343,7 @@ module AllocHow = struct
     | Prim Float32 -> SR.UnboxedFloat32
     | _ -> SR.Vanilla
 
-  let dec lvl how_outer (seen, how0) dec =
-    let how_all = disjoint_union how_outer how0 in
-
+  let dec lvl (seen, how0) dec =
     let (f,d) = Freevars.dec dec in
     let captured = S.inter (set_of_map how0) (Freevars.captured_vars f) in
 
@@ -10373,32 +10366,22 @@ module AllocHow = struct
         M.map (fun t -> LocalImmut (stackrep_of_type t)) d in
 
     (* Which allocation does this require for its captured things? *)
-    let how2 = how_captured lvl how_all seen captured in
+    (* [captured] only contains keys from [how0]. Looking through its union
+       with the outer environment rebuilt a much larger map without changing
+       any lookup result. *)
+    let how2 = how_captured lvl how0 seen captured in
 
     let how = joins [how0; how1; how2] in
     let seen' = S.union seen (set_of_map d)
     in (seen', how)
 
-  (* find the allocHow for the variables currently in scope *)
-  (* we assume things are mutable, as we do not know better here *)
-  let how_of_ae ae : allocHow =
-    M.map (fun (l, _) -> match l with
-    | VarEnv.Const _        -> (Const : how)
-    | VarEnv.HeapStatic _   -> StoreStatic
-    | VarEnv.HeapInd _      -> StoreHeap
-    | VarEnv.Local (sr, _)  -> LocalMut sr (* conservatively assume mutable *)
-    | VarEnv.PublicMethod _ -> LocalMut SR.Vanilla
-    ) ae.VarEnv.vars
-
   let decs (ae : VarEnv.t) decs captured_in_body : allocHow =
     let lvl = ae.VarEnv.lvl in
-    let how_outer = how_of_ae ae in
     let defined_here = snd (Freevars.decs decs) in (* TODO: implement gather_decs more directly *)
-    let how_outer = Freevars.diff how_outer defined_here in (* shadowing *)
     let how0 = M.map (fun _t -> (Const : how)) defined_here in
     let captured = S.inter (set_of_map defined_here) captured_in_body in
     let rec go how =
-      let seen, how1 = List.fold_left (dec lvl how_outer) (S.empty, how) decs in
+      let seen, how1 = List.fold_left (dec lvl) (S.empty, how) decs in
       assert (S.equal seen (set_of_map defined_here));
       let how2 = how_captured lvl how1 seen captured in
       let how' = join how1 how2 in

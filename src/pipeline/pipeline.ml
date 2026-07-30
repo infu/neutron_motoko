@@ -845,7 +845,7 @@ let adjust_flags () =
 
 (* This transforms the flat list of libs (some of which are classes)
    into a list of imported libs and (compiled) classes *)
-let rec compile_libs mode libs : Lowering.Desugar.import_declaration =
+let rec compile_libs mode rts libs : Lowering.Desugar.import_declaration =
   let open Source in
   let rec go rev_imports = function
     | [] -> List.rev rev_imports
@@ -858,7 +858,10 @@ let rec compile_libs mode libs : Lowering.Desugar.import_declaration =
           | Syntax.ActorClassU _ ->
             (* Okay to "run" here, as `compile_unit_to_wasm` only fails on Syntax.MixinU *)
             let imports = List.rev rev_imports in
-            let wasm = Diag.run (compile_unit_to_wasm mode None imports l) in
+            let wasm =
+              Diag.run
+                (compile_unit_to_wasm mode None rts imports l)
+            in
             Lowering.Desugar.import_compiled_class l wasm
           | _ ->
             Lowering.Desugar.import_unit l)
@@ -866,7 +869,7 @@ let rec compile_libs mode libs : Lowering.Desugar.import_declaration =
       go (List.rev_append new_imports rev_imports) libs
   in go [] libs
 
-and compile_unit mode (enhanced_migration:string option) do_link imports u : Wasm_exts.CustomModule.extended_module Diag.result =
+and compile_unit mode (enhanced_migration:string option) rts imports u : Wasm_exts.CustomModule.extended_module Diag.result =
   let open Diag.Syntax in
   let name = u.note.Syntax.filename in
   Cons.session ~scope:name (fun () ->
@@ -874,23 +877,27 @@ and compile_unit mode (enhanced_migration:string option) do_link imports u : Was
     let prog_ir = ir_passes mode prog_ir name in
     phase "Compiling" name;
     adjust_flags ();
-    let rts = if do_link then Some (load_as_rts ()) else None in
+    let rts = Option.map Lazy.force rts in
     Diag.return (if !Flags.enhanced_orthogonal_persistence then
       Codegen.Compile_enhanced.compile mode ~enhanced_migration rts prog_ir
     else
       Codegen.Compile_classical.compile mode rts prog_ir))
 
-and compile_unit_to_wasm mode (enhanced_migration:string option) imports (u : Syntax.comp_unit) : string Diag.result =
+and compile_unit_to_wasm mode (enhanced_migration:string option) rts imports (u : Syntax.comp_unit) : string Diag.result =
   let open Diag.Syntax in
-  let* wasm_mod = compile_unit mode enhanced_migration true imports u in
+  let* wasm_mod = compile_unit mode enhanced_migration (Some rts) imports u in
   let wasm = Wasm_exts.CustomModuleEncode.encode_wasm wasm_mod in
   Diag.return wasm
 
 and compile_progs mode do_link libs progs : Wasm_exts.CustomModule.extended_module Diag.result =
-  let imports = compile_libs mode libs in
+  (* Actor classes are compiled separately, but every one links the same
+     immutable decoded RTS. Decode it at most once for the whole compile. *)
+  let rts = lazy (load_as_rts ()) in
+  let imports = compile_libs mode rts libs in
   let prog = CompUnit.combine_progs progs in
   let u = CompUnit.comp_unit_of_prog false prog in
-  compile_unit mode (!Flags.enhanced_migration) do_link imports u
+  let main_rts = if do_link then Some rts else None in
+  compile_unit mode (!Flags.enhanced_migration) main_rts imports u
 
 let compile_files mode do_link files : compile_result =
   let open Diag.Syntax in

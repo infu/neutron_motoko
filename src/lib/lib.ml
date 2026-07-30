@@ -320,7 +320,19 @@ type ('a, 'b) these =
 
 module List =
 struct
-  let flatten lists = StdList.concat_map (fun list -> list) lists
+  (* Keep flattening stack-safe without paying for an identity callback at every
+     element. [tail_mod_cons] is lowered by OCaml before wasm_of_ocaml, so this
+     does not depend on Wasm tail-call support in the browser. *)
+  let flatten lists =
+    let[@tail_mod_cons] rec loop current rest =
+      match current with
+      | x :: xs -> x :: loop xs rest
+      | [] ->
+        match rest with
+        | [] -> []
+        | next :: rest -> loop next rest
+    in
+    loop [] lists
   let concat = flatten
 
   let rec make n x = make' n x []

@@ -1223,14 +1223,12 @@ let encode_internal ~emit_source_map (em : extended_module) =
             pairing (attr, form) (f ())
           | StringAttribute (a, path0) when a = Dwarf5.dw_AT_decl_file ->
             let path = if path0 = "" then "prim" else path0 in
-            if attr <> a then Printf.printf "DATA1 attr: 0x%x = a: 0x%x (in TAG 0x%x) PATH: %s  ULT: (%s, %d)\n" attr a t path    (fst (List.hd !(state.source_path_indices))) (snd (List.hd !(state.source_path_indices)));
             assert (attr = a);
             writeForm form
               (IntAttribute (a,
                 List.(snd (hd !(state.source_path_indices)) -
                       assoc path !(state.source_path_indices))))
           | IntAttribute (a, _) as art ->
-            if attr <> a then Printf.printf "attr: 0x%x = a: 0x%x (in TAG 0x%x)\n" attr a t;
             assert (attr = a);
             writeForm form art
           | StringAttribute (a, _) as art -> assert (attr = a); writeForm form art
