@@ -9,6 +9,11 @@ exception TooLargeDataSegments of string
 val link : Wasm_exts.CustomModule.extended_module -> string -> Wasm_exts.CustomModule.extended_module -> Wasm_exts.CustomModule.extended_module
 
 module For_testing : sig
+  val calculate_renaming :
+    int32 -> int32 -> int32 ->
+    (int32 * int32) list -> (int32 * int32) list ->
+    (int32 -> int32) * (int32 -> int32)
+
   val remap_module_indices :
     ?type_index:(int32 -> int32) ->
     ?function_index:(int32 -> int32) ->

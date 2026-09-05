@@ -10794,7 +10794,7 @@ module AllocHow = struct
 
   let dec lvl (seen, how0) dec =
     let (f,d) = Freevars.dec dec in
-    let captured = S.inter (set_of_map how0) (Freevars.captured_vars f) in
+    let captured = Freevars.captured_vars f in
 
     (* Which allocation is required for the things defined here? *)
     let how1 = match dec.it with
@@ -10815,9 +10815,9 @@ module AllocHow = struct
         M.map (fun t -> LocalImmut (stackrep_of_type t)) d in
 
     (* Which allocation does this require for its captured things? *)
-    (* [captured] only contains keys from [how0]. Looking through its union
-       with the outer environment rebuilt a much larger map without changing
-       any lookup result. *)
+    (* [how_captured] already ignores names absent from [how0], including
+       outer bindings. Do not rebuild the whole block's key set for every
+       declaration just to discard those names in advance. *)
     let how2 = how_captured lvl how0 seen captured in
 
     let how = joins [how0; how1; how2] in
@@ -13631,20 +13631,18 @@ and compile_dec env pre_ae how v2en dec : VarEnv.t * G.t * (VarEnv.t -> scope_wr
 
 and compile_decs_public env pre_ae decs v2en captured_in_body : VarEnv.t * scope_wrap =
   let how = AllocHow.decs pre_ae decs captured_in_body in
-  let rec go pre_ae = function
-    | []        -> (pre_ae, G.nop, fun _ -> unmodified)
-    | [dec]     -> compile_dec env pre_ae how v2en dec
-    | dec::decs ->
-        let (pre_ae1, alloc_code1, mk_codeW1) = compile_dec env pre_ae how v2en dec in
-        let (pre_ae2, alloc_code2, mk_codeW2) = go              pre_ae1 decs in
-        ( pre_ae2,
-          alloc_code1 ^^ alloc_code2,
-          fun ae -> let codeW1 = mk_codeW1 ae in
-                    let codeW2 = mk_codeW2 ae in
-                    fun body_code -> codeW1 (codeW2 body_code)
-        ) in
-  let (ae1, alloc_code, mk_codeW) = go pre_ae decs in
-  (ae1, fun body_code -> alloc_code ^^ mk_codeW ae1 body_code)
+  let rec go pre_ae alloc_code rev_mk_codeW = function
+    | [] -> (pre_ae, alloc_code, List.rev rev_mk_codeW)
+    | dec :: decs ->
+      let pre_ae1, alloc_code1, mk_codeW1 = compile_dec env pre_ae how v2en dec in
+      go pre_ae1 (alloc_code ^^ alloc_code1) (mk_codeW1 :: rev_mk_codeW) decs in
+  let ae1, alloc_code, mk_codeWs = go pre_ae G.nop [] decs in
+  (ae1, fun body_code ->
+    (* Resolve all declarations against the completed environment in source
+       order, then apply their scope wrappers from right to left as before.
+       Neither phase builds a declaration-count-sized call stack. *)
+    let rev_codeWs = List.rev_map (fun mk_codeW -> mk_codeW ae1) mk_codeWs in
+    alloc_code ^^ List.fold_left (fun body codeW -> codeW body) body_code rev_codeWs)
 
 and compile_decs env ae decs captured_in_body : VarEnv.t * scope_wrap =
   compile_decs_public env ae decs E.NameEnv.empty captured_in_body

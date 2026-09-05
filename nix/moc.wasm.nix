@@ -48,7 +48,10 @@ pkgs.stdenv.mkDerivation {
 
       const inspected = compiler.inspectMotoko(
         "inspect.mo",
-        `import Prim "mo:prim"; module {
+        `import Prim "mo:prim";
+        import { cyclesBurn = burn; type cyclesBalance } "mo:prim";
+        module {
+          let { regionNew = allocate } = Prim;
           public func inspect(target : Text) : actor {} {
             Prim.cyclesAdd(1);
             actor (target)
@@ -57,9 +60,21 @@ pkgs.stdenv.mkDerivation {
       );
       if (!inspected.code || !inspected.code.hasActorUrl ||
           inspected.code.dotMembers[0] !== "cyclesAdd" ||
-          inspected.code.immediateImports[0] !== "mo:prim") {
+          JSON.stringify(inspected.code.patternFields) !== '["cyclesBurn","regionNew"]' ||
+          JSON.stringify(inspected.code.immediateImports) !== '["mo:prim","mo:prim"]') {
         console.error(JSON.stringify(inspected));
         throw new Error("Compact Motoko inspection returned incorrect facts");
+      }
+
+      const deepInspection = compiler.inspectMotoko(
+        "deep-inspect.mo",
+        "module { public let cyclesAdd = " + Array(10000).fill("1").join(" + ") + " }"
+      );
+      if (!deepInspection.code ||
+          JSON.stringify(deepInspection.code.patternFields) !== "[]" ||
+          JSON.stringify(deepInspection.code.dotMembers) !== "[]" ||
+          "ast" in deepInspection.code || "rawExp" in deepInspection.code) {
+        throw new Error("Deep compact inspection returned incorrect facts");
       }
 
       compiler.saveFile(

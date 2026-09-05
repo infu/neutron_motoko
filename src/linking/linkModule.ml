@@ -315,30 +315,33 @@ let resolve imports exports : (int32 * int32) list =
 let calculate_renaming n_imports1 n_things1 n_imports2 resolved12 resolved21 : (renumbering * renumbering) =
   let open Int32 in
 
-  let n_imports1' = sub n_imports1 (Lib.List32.length resolved12) in
-  let n_imports2' = sub n_imports2 (Lib.List32.length resolved21) in
+  let n_resolved12 = Lib.List32.length resolved12 in
+  let n_resolved21 = Lib.List32.length resolved21 in
+  let n_imports1' = sub n_imports1 n_resolved12 in
+  let n_imports2' = sub n_imports2 n_resolved21 in
 
   let rec fun1 i =
+    (* Every resolved index is an import. Defined indices therefore skip the
+       entire sorted list and need only its precomputed length. *)
+    if i >= n_imports1 then sub (add i n_imports2') n_resolved12
+    else
     let rec go skipped = function
       | (imp, exp)::is ->
         if i < imp then sub i skipped
         else if i = imp then fun2 exp
         else go (add skipped 1l) is
-      | [] ->
-        if i < n_imports1
-        then sub i skipped
-        else sub (add i n_imports2') skipped
+      | [] -> sub i skipped
     in go 0l resolved12
   and fun2 i =
+    if i >= n_imports2
+    then sub (add (add i n_imports1') n_things1) n_resolved21
+    else
     let rec go skipped = function
       | (imp, exp)::is ->
         if i < imp then sub (add i n_imports1') skipped
         else if i = imp then fun1 exp
         else go (add skipped 1l) is
-      | [] ->
-        if i < n_imports2
-        then sub (add i n_imports1') skipped
-        else sub (add (add i n_imports1') n_things1) skipped
+      | [] -> sub (add i n_imports1') skipped
     in go 0l resolved21
   in
   (fun1, fun2)
@@ -1374,6 +1377,8 @@ let link (em1 : extended_module) libname (em2 : extended_module) =
   { merged with module_ = final }
 
 module For_testing = struct
+  let calculate_renaming = calculate_renaming
+
   let remap_module_indices
       ?(type_index = identity_index)
       ?(function_index = identity_index)

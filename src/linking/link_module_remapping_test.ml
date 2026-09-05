@@ -83,6 +83,142 @@ let test_module type_offset function_offset global_offset =
 let check name condition =
   if not condition then failwith ("linker remapping test failed: " ^ name)
 
+(* Preserve the original list-scanning implementation as an independent oracle
+   for the defined-index fast paths, including recursive import resolution. *)
+let original_calculate_renaming
+    n_imports1 n_things1 n_imports2 resolved12 resolved21 =
+  let open Int32 in
+  let n_imports1' = sub n_imports1 (Lib.List32.length resolved12) in
+  let n_imports2' = sub n_imports2 (Lib.List32.length resolved21) in
+  let rec fun1 i =
+    let rec go skipped = function
+      | (imp, exp) :: is ->
+        if i < imp then sub i skipped
+        else if i = imp then fun2 exp
+        else go (add skipped 1l) is
+      | [] ->
+        if i < n_imports1
+        then sub i skipped
+        else sub (add i n_imports2') skipped
+    in go 0l resolved12
+  and fun2 i =
+    let rec go skipped = function
+      | (imp, exp) :: is ->
+        if i < imp then sub (add i n_imports1') skipped
+        else if i = imp then fun1 exp
+        else go (add skipped 1l) is
+      | [] ->
+        if i < n_imports2
+        then sub (add i n_imports1') skipped
+        else sub (add (add i n_imports1') n_things1) skipped
+    in go 0l resolved21
+  in
+  fun1, fun2
+
+let compare_renamings
+    n_imports1 n_things1 n_imports2 n_things2 resolved12 resolved21 =
+  let arguments calculate =
+    calculate (Int32.of_int n_imports1) (Int32.of_int n_things1)
+      (Int32.of_int n_imports2) resolved12 resolved21
+  in
+  let actual1, actual2 = arguments Remap.calculate_renaming in
+  let expected1, expected2 = arguments original_calculate_renaming in
+  let compare side actual expected last =
+    (* Include the first index after each module as well: for a module without
+       definitions this still exercises the exact import/definition boundary. *)
+    for index = 0 to last do
+      let index = Int32.of_int index in
+      if actual index <> expected index then
+        failwith (Printf.sprintf
+          "linker renaming mismatch: module %d, index %ld" side index)
+    done
+  in
+  compare 1 actual1 expected1 (n_imports1 + n_things1);
+  compare 2 actual2 expected2 (n_imports2 + n_things2)
+
+let every_resolution n_imports n_targets visit =
+  let rec choose index reversed =
+    if index = n_imports then visit (List.rev reversed)
+    else begin
+      choose (index + 1) reversed;
+      for target = 0 to n_targets - 1 do
+        choose (index + 1)
+          ((Int32.of_int index, Int32.of_int target) :: reversed)
+      done
+    end
+  in
+  choose 0 []
+
+let terminating_resolutions resolved12 resolved21 =
+  (* Cyclic import aliases do not terminate in the original linker either;
+     enumerate and exclude them without changing the linker's behavior. *)
+  let limit = List.length resolved12 + List.length resolved21 + 1 in
+  let rec terminates remaining first index =
+    if remaining = 0 then false
+    else
+      match List.assoc_opt index (if first then resolved12 else resolved21) with
+      | None -> true
+      | Some target -> terminates (remaining - 1) (not first) target
+  in
+  List.for_all (fun (index, _) -> terminates limit true index) resolved12 &&
+  List.for_all (fun (index, _) -> terminates limit false index) resolved21
+
+let test_exhaustive_renaming () =
+  let compared = ref 0 in
+  let cyclic = ref 0 in
+  for n_imports1 = 0 to 3 do
+    for n_imports2 = 0 to 3 do
+      for n_things1 = 0 to 2 do
+        for n_things2 = 0 to 2 do
+          every_resolution n_imports1 (n_imports2 + n_things2)
+            (fun resolved12 ->
+              every_resolution n_imports2 (n_imports1 + n_things1)
+                (fun resolved21 ->
+                  if terminating_resolutions resolved12 resolved21 then begin
+                    incr compared;
+                    compare_renamings n_imports1 n_things1 n_imports2 n_things2
+                      resolved12 resolved21
+                  end else incr cyclic))
+        done
+      done
+    done
+  done;
+  check "terminating import graphs exercised" (!compared > 100_000);
+  check "cyclic import graphs excluded" (!cyclic > 0);
+  Printf.printf "linker renaming: %d terminating import graphs compared\n%!"
+    !compared
+
+let test_renaming_boundaries () =
+  (* These resolutions include a chain through both modules, gaps, a direct
+     reference to an unresolved import, and both first defined indices. *)
+  let first, second = Remap.calculate_renaming 3l 2l 3l
+      [0l, 1l; 2l, 0l] [1l, 2l; 2l, 3l] in
+  check "cross-import chain and first module boundary"
+    (List.map first [0l; 1l; 2l; 3l; 4l] = [1l; 0l; 1l; 2l; 3l]);
+  check "unresolved import and second module boundary"
+    (List.map second [0l; 1l; 2l; 3l; 4l] = [1l; 1l; 2l; 4l; 5l]);
+  let actual1, actual2 = Remap.calculate_renaming
+      2l Int32.max_int 3l [1l, 3l] [0l, 2l; 2l, 1l] in
+  let expected1, expected2 = original_calculate_renaming
+      2l Int32.max_int 3l [1l, 3l] [0l, 2l; 2l, 1l] in
+  List.iter (fun index ->
+    check "Int32 first-module arithmetic"
+      (actual1 index = expected1 index);
+    check "Int32 second-module arithmetic"
+      (actual2 index = expected2 index)
+  ) [0l; 1l; 2l; 3l; Int32.pred Int32.max_int; Int32.max_int]
+
+let test_large_renaming () =
+  let resolved12 = List.init 256 (fun index -> index)
+    |> List.filter_map (fun index ->
+      if index mod 3 <> 0 then None
+      else Some (Int32.of_int index, Int32.of_int (384 + index * 13))) in
+  let resolved21 = List.init 384 (fun index -> index)
+    |> List.filter_map (fun index ->
+      if index mod 5 <> 0 then None
+      else Some (Int32.of_int index, Int32.of_int (256 + index * 37))) in
+  compare_renamings 256 20_000 384 4_000 resolved12 resolved21
+
 let test_identity () =
   let module_ = test_module 0l 0l 0l in
   check "identity" (Remap.remap_module_indices module_ = module_)
@@ -196,6 +332,9 @@ let test_deeply_nested_body () =
   check "deeply nested body" result
 
 let () =
+  test_exhaustive_renaming ();
+  test_renaming_boundaries ();
+  test_large_renaming ();
   test_identity ();
   test_all_index_spaces_and_names ();
   test_type_first_seen_order ();

@@ -383,10 +383,13 @@ struct
     | [] -> None
     | xs -> Some (last xs)
 
-  let rec split_last = function
-    | [x] -> [], x
-    | x::xs -> let ys, y = split_last xs in x::ys, y
-    | [] -> failwith "split_last"
+  let split_last xs =
+    let rec loop rev_prefix = function
+      | [x] -> List.rev rev_prefix, x
+      | x::xs -> loop (x::rev_prefix) xs
+      | [] -> failwith "split_last"
+    in
+    loop [] xs
 
   let rec index_where p xs = index_where' p xs 0
   and index_where' p xs i =
@@ -720,6 +723,40 @@ struct
     Stdlib.List.length flattened = 100_000 &&
     Stdlib.List.hd flattened = 0 &&
     List.last flattened = 99_999
+
+  let%test "List.split_last preserves the empty-list exception" =
+    try
+      ignore (List.split_last []);
+      false
+    with Failure message -> message = "split_last"
+
+  let%test "List.split_last preserves a singleton element" =
+    let element = ref 42 in
+    let prefix, last = List.split_last [element] in
+    prefix = [] && last == element
+
+  let%test "List.split_last agrees with the recursive implementation" =
+    let rec reference = function
+      | [x] -> [], x
+      | x::xs -> let ys, y = reference xs in x::ys, y
+      | [] -> failwith "split_last"
+    in
+    let random = Random.State.make [|0x51_17|] in
+    let rec check remaining =
+      remaining = 0 ||
+      let length = 1 + Random.State.int random 64 in
+      let values = List.table length (fun _ -> Random.State.int random 100) in
+      List.split_last values = reference values && check (remaining - 1)
+    in
+    check 1_000
+
+  let%test "List.split_last is stack-safe and ordered for a long list" =
+    let prefix, last = List.split_last (List.table 100_000 (fun index -> index)) in
+    let rec ordered expected = function
+      | [] -> expected = 99_999
+      | value::rest -> value = expected && ordered (expected + 1) rest
+    in
+    last = 99_999 && ordered 0 prefix
 
   let%test "bytes_of_hex DEADBEEF" =
     Hex.bytes_of_hex "DEADBEEF" = "\xDE\xAD\xBE\xEF"

@@ -219,11 +219,14 @@ module Compact_inspect = struct
     | DecField of dec_field
     | ExpField of exp_field
     | Case of case
+    | Pat of pat
+    | PatField of pat_field
 
   type result = {
     imports : string list;
     has_actor_url : bool;
     dot_members : string list;
+    pattern_fields : string list;
   }
 
   let prepend f xs rest =
@@ -234,11 +237,24 @@ module Compact_inspect = struct
     let has_actor_url = ref false in
     let dot_members = ref [] in
     let seen_dot_members = Hashtbl.create 16 in
+    let pattern_fields = ref [] in
+    let seen_pattern_fields = Hashtbl.create 16 in
     let add_dot_member member =
       if not (Hashtbl.mem seen_dot_members member) then begin
         Hashtbl.add seen_dot_members member ();
         dot_members := member :: !dot_members
       end
+    in
+    let add_pattern_field field =
+      if not (Hashtbl.mem seen_pattern_fields field) then begin
+        Hashtbl.add seen_pattern_fields field ();
+        pattern_fields := field :: !pattern_fields
+      end
+    in
+    let prepend_shared_pattern sort rest =
+      match sort.it with
+      | Mo_types.Type.Local -> rest
+      | Mo_types.Type.Shared (_, pattern) -> Pat pattern :: rest
     in
     let rec loop = function
       | [] ->
@@ -246,6 +262,7 @@ module Compact_inspect = struct
           imports = List.rev !imports;
           has_actor_url = !has_actor_url;
           dot_members = List.rev !dot_members;
+          pattern_fields = List.rev !pattern_fields;
         }
       | Exp e :: rest ->
         begin match e.it with
@@ -296,8 +313,8 @@ module Compact_inspect = struct
         | ObjE (bases, fields) ->
           let rest = prepend (fun field -> ExpField field) fields rest in
           loop (prepend (fun base -> Exp base) bases rest)
-        | FuncE (_, _, _, _, _, _, body) ->
-          loop (Exp body :: rest)
+        | FuncE (_, sort, _, pattern, _, _, body) ->
+          loop (prepend_shared_pattern sort (Pat pattern :: Exp body :: rest))
         | CallE (_, callee, _, (_, argument)) ->
           (* Match the full-AST API's include_parenthetical = false behavior. *)
           loop (Exp callee :: Exp !argument :: rest)
@@ -311,8 +328,8 @@ module Compact_inspect = struct
           loop (Exp body :: rest)
         | LoopE (body, Some condition, _) ->
           loop (Exp body :: Exp condition :: rest)
-        | ForE (_, iterator, body, _) ->
-          loop (Exp iterator :: Exp body :: rest)
+        | ForE (pattern, iterator, body, _) ->
+          loop (Pat pattern :: Exp iterator :: Exp body :: rest)
         | AsyncE (_, _, _, body) ->
           loop (Exp body :: rest)
         | TryE (body, cases, finally) ->
@@ -322,18 +339,39 @@ module Compact_inspect = struct
       | Dec declaration :: rest ->
         begin match declaration.it with
         | ExpD e | VarD (_, e) -> loop (Exp e :: rest)
-        | LetD (_, e, None) -> loop (Exp e :: rest)
-        | LetD (_, e, Some fail) -> loop (Exp e :: Exp fail :: rest)
+        | LetD (pattern, e, None) -> loop (Pat pattern :: Exp e :: rest)
+        | LetD (pattern, e, Some fail) ->
+          loop (Pat pattern :: Exp e :: Exp fail :: rest)
         | TypD _ -> loop rest
-        | ClassD (_, _, _, _, _, _, _, _, fields)
-        | MixinD (_, _, fields) ->
+        | ClassD (_, sort, _, _, _, pattern, _, _, fields) ->
           (* Class parenthetical expressions are omitted by js_parse_motoko. *)
-          loop (prepend (fun field -> DecField field) fields rest)
+          loop (prepend_shared_pattern sort
+            (Pat pattern :: prepend (fun field -> DecField field) fields rest))
+        | MixinD (_, pattern, fields) ->
+          loop (Pat pattern :: prepend (fun field -> DecField field) fields rest)
         | IncludeD (_, _, e, _) -> loop (Exp e :: rest)
         end
       | DecField field :: rest -> loop (Dec field.it.dec :: rest)
       | ExpField field :: rest -> loop (Exp field.it.exp :: rest)
-      | Case case :: rest -> loop (Exp case.it.exp :: rest)
+      | Case case :: rest -> loop (Pat case.it.pat :: Exp case.it.exp :: rest)
+      | Pat pattern :: rest ->
+        begin match pattern.it with
+        | WildP | VarP _ | LitP _ | SignP _ -> loop rest
+        | TupP patterns -> loop (prepend (fun child -> Pat child) patterns rest)
+        | ObjP fields -> loop (prepend (fun field -> PatField field) fields rest)
+        | OptP child | TagP (_, child) | AnnotP (child, _) | ParP child ->
+          loop (Pat child :: rest)
+        | AltP (left, right) | AndP (left, right) ->
+          loop (Pat left :: Pat right :: rest)
+        end
+      | PatField field :: rest ->
+        begin match field.it with
+        | ValPF (name, pattern) ->
+          (* Match Arrange's ValPF, not local bindings or type fields. *)
+          add_pattern_field name.it;
+          loop (Pat pattern :: rest)
+        | TypPF _ -> loop rest
+        end
     in
     loop (prepend (fun declaration -> Dec declaration) prog.it [])
 end
@@ -361,6 +399,7 @@ let js_inspect_motoko path s =
       val immediateImports = strings inspection.imports
       val hasActorUrl = Js.bool inspection.has_actor_url
       val dotMembers = strings inspection.dot_members
+      val patternFields = strings inspection.pattern_fields
     end))
 
 module Map_conversion (Map : Map.S) = struct

@@ -11,6 +11,8 @@ val encode_wasm_bytes : CustomModule.extended_module -> bytes
 val encode_wasm : CustomModule.extended_module -> string
 
 module For_testing : sig
+  val compress_locals : Types.value_type list -> (Types.value_type * int) list
+
   type counters = {
     source_loads : int;
     map_serializations : int;

@@ -143,7 +143,22 @@ let promise_reference_slot p =
 let allocate_reference_slot () =
   promise_reference_slot (Promise.make ())
 
+(* Count a complete run before allocating its result. Unlike a right fold,
+   this uses neither the call stack nor a fresh pair/list cell for every local
+   in a run. The constructor-producing calls are made stack-safe by OCaml. *)
+let compress_locals ts =
+  let[@tail_mod_cons] rec run t n = function
+    | t' :: ts when t = t' -> run t (n + 1) ts
+    | t' :: ts -> (t, n) :: run t' 1 ts
+    | [] -> [t, n]
+  in
+  match ts with
+  | [] -> []
+  | t :: ts -> run t 1 ts
+
 module For_testing = struct
+  let compress_locals = compress_locals
+
   type counters = {
     source_loads : int;
     map_serializations : int;
@@ -544,37 +559,12 @@ let encode_internal ~emit_source_map (em : extended_module) =
       | ValBlockType None -> vs7 (-0x40)
       | ValBlockType (Some t) -> value_type t
 
-    let rec instr noting e =
-      if emit_source_map && e.at <> no_region then
-        add_to_map e.at.left.file e.at.left.line e.at.left.column 0 (pos s);
-      if emit_debug_info then noting e;
-      let instr = instr noting in
-
+    let simple_instr e =
       match e.it with
-      | Meta _ when not emit_debug_info -> ()
-      | Meta TagClose -> close_dwarf true
-      | Meta (StatementDelimiter left) ->
-        let state = get_debug () in
-        modif state.statement_positions (Instrs.add (pos s, left))
-      | Meta (Tag (r, t, attrs_tags)) ->
-        let tags, attrs = List.partition (function Tag _ | Grouped _ -> true | _ -> false) attrs_tags in
-        extract_dwarf r t attrs;
-        List.iter (fun t -> instr { e with it = (Meta t) }) tags
-      | Meta (Grouped []) -> ()
-      | Meta (Grouped (late :: former)) ->
-        instr { e with it = Meta (Grouped former) };
-        instr { e with it = Meta late }
-      | Meta _ -> assert false
+      | Meta _ | Block _ | Loop _ | If _ -> assert false
 
       | Unreachable -> op 0x00
       | Nop -> op 0x01
-
-      | Block (bt, es) -> op 0x02; block_type bt; list instr es; end_ ()
-      | Loop (bt, es) -> op 0x03; block_type bt; list instr es; end_ ()
-      | If (bt, es1, es2) ->
-        op 0x04; block_type bt; list instr es1;
-        if es2 <> [] then op 0x05;
-        list instr es2; end_ ()
 
       | Br x -> op 0x0c; var x
       | BrIf x -> op 0x0d; var x
@@ -819,8 +809,63 @@ let encode_internal ~emit_source_map (em : extended_module) =
       | StableRead -> op 0xfc; vu32 0x0al; u8 0x00; u8 0x01
       | StableWrite -> op 0xfc; vu32 0x0al; u8 0x01; u8 0x00
 
+    (* Only nested bodies need continuation frames; flat instruction lists do
+       not allocate a closure or work item for each instruction. Keep mapping
+       and debug callbacks before each instruction, including synthetic Meta
+       nodes, exactly as in the recursive traversal. *)
+    type instr_cont =
+      | Done
+      | Next of instr list * instr_cont
+      | End of instr list * instr_cont
+      | Else of instr list * instr list * instr_cont
+
+    let instrs noting body =
+      let rec loop es cont =
+        match es with
+        | [] ->
+          begin match cont with
+          | Done -> ()
+          | Next (es, cont) -> loop es cont
+          | End (es, cont) -> end_ (); loop es cont
+          | Else (else_body, es, cont) ->
+            if else_body <> [] then op 0x05;
+            loop else_body (End (es, cont))
+          end
+        | e :: es ->
+          if emit_source_map && e.at <> no_region then
+            add_to_map e.at.left.file e.at.left.line e.at.left.column 0 (pos s);
+          if emit_debug_info then noting e;
+          match e.it with
+          | Meta _ when not emit_debug_info -> loop es cont
+          | Meta TagClose -> close_dwarf true; loop es cont
+          | Meta (StatementDelimiter left) ->
+            let state = get_debug () in
+            modif state.statement_positions (Instrs.add (pos s, left));
+            loop es cont
+          | Meta (Tag (r, t, attrs_tags)) ->
+            let tags, attrs =
+              List.partition (function Tag _ | Grouped _ -> true | _ -> false) attrs_tags in
+            extract_dwarf r t attrs;
+            let tags = List.map (fun t -> {e with it = Meta t}) tags in
+            loop tags (Next (es, cont))
+          | Meta (Grouped []) -> loop es cont
+          | Meta (Grouped (late :: former)) ->
+            loop [{e with it = Meta (Grouped former)}]
+              (Next ({e with it = Meta late} :: es, cont))
+          | Meta _ -> assert false
+          | Block (bt, body) ->
+            op 0x02; block_type bt; loop body (End (es, cont))
+          | Loop (bt, body) ->
+            op 0x03; block_type bt; loop body (End (es, cont))
+          | If (bt, then_body, else_body) ->
+            op 0x04; block_type bt;
+            loop then_body (Else (else_body, es, cont))
+          | _ -> simple_instr e; loop es cont
+      in
+      loop body Done
+
     let const c =
-      list (instr ignore) c.it; end_ ()
+      instrs ignore c.it; end_ ()
 
     (* Sections *)
 
@@ -910,12 +955,6 @@ let encode_internal ~emit_source_map (em : extended_module) =
       section 8 (opt var) xo (xo <> None)
 
     (* Code section *)
-    let compress ts =
-      let combine t = function
-        | (t', n) :: ts when t = t' -> (t, n + 1) :: ts
-        | ts -> (t, 1) :: ts
-      in List.fold_right combine ts []
-
     let local (t, n) = len n; value_type t
 
     let add_source_name =
@@ -947,7 +986,7 @@ let encode_internal ~emit_source_map (em : extended_module) =
       let {locals; body; _} = f.it in
       let g = gap32 () in
       let p = pos s in
-      vec local (compress locals);
+      vec local (compress_locals locals);
       let instr_notes =
         if emit_debug_info then Some (ref Instrs.empty) else None in
       let note i =
@@ -956,7 +995,7 @@ let encode_internal ~emit_source_map (em : extended_module) =
           modif notes (Instrs.add (pos s, i.at.left));
           add_source_name i.at.left.file
         | _ -> () in
-      list (instr note) body;
+      instrs note body;
       begin match instr_notes with
       | Some notes ->
         modif notes (Instrs.add (pos s, f.at.right));
